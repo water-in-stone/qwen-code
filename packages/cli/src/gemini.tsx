@@ -43,6 +43,7 @@ import {
   preResolveHomeEnvOverrides,
 } from './config/settings.js';
 import { SettingsWatcher } from './config/settingsWatcher.js';
+import { registerMcpHotReload } from './config/hotReload.js';
 import {
   initializeApp,
   type InitializationResult,
@@ -806,6 +807,19 @@ export async function main() {
       settingsWatcher,
     );
     profileCheckpoint('after_load_cli_config');
+
+    // Subscribe the running Config to settings changes so MCP servers
+    // reconnect / disconnect / restart without a session restart (#3696,
+    // sub-task 3). Skipped in bare mode (no watcher).
+    if (settingsWatcher) {
+      const disposeMcpHotReload = registerMcpHotReload(
+        settingsWatcher,
+        settings,
+        config,
+        config.getTopTierMcpServers(),
+      );
+      registerCleanup(disposeMcpHotReload);
+    }
 
     // Phase D-1: persist the WorktreeSession sidecar so Phase C's restore
     // machinery on a subsequent `--resume` picks the worktree back up, and

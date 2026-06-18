@@ -402,9 +402,15 @@ Edit `~/.qwen/settings.json` during a running session and observe debug log outp
 >
 > - **Done:** the `requiresRestart`-based suppression gate in
 >   `SettingsWatcher.handleChange()` plus unit tests (see Mechanism below).
-> - **Pending:** the two `requiresRestart` schema corrections
+> - **Done (sub-task 3):** the MCP `requiresRestart` corrections required for
+>   runtime MCP reconnection — `mcpServers`, `mcp.allowed`, `mcp.excluded`
+>   flipped `true → false` so MCP-only edits are no longer suppressed (the
+>   parent `mcp` and `mcp.serverCommand` stay restart-required). See
+>   `mcp-runtime-reinitialization.zh.md` for the dependency rationale.
+> - **Pending:** the two _unrelated_ `requiresRestart` schema corrections
 >   (`modelProviders` → `true`, `permissions.*` → keep hot-reloadable), each
->   gated on verifying the runtime read path first.
+>   gated on verifying the runtime read path first. These are independent of the
+>   MCP flips above.
 
 ### Motivation
 
@@ -493,10 +499,13 @@ before flipping the flag.**
 ### Acceptance
 
 - A change touching only restart-required/sensitive keys (`security.auth.*`,
-  `env`, `modelProviders`, `mcpServers`, `proxy`, …) emits **no**
-  `SettingsChangeEvent`.
-- A change to a hot-reloadable key (`ui.*`, `model.name`, `permissions.*` once
-  flipped, …) still emits an event.
+  `env`, `modelProviders`, `mcp.serverCommand`, `proxy`, …) emits **no**
+  `SettingsChangeEvent`. (Note: `mcpServers` / `mcp.allowed` / `mcp.excluded`
+  are **hot-reloadable** as of sub-task 3 and intentionally **not** in this
+  list — an MCP-only edit must still emit so the reconcile can run.)
+- A change to a hot-reloadable key (`ui.*`, `model.name`, `mcpServers`,
+  `mcp.allowed`, `mcp.excluded`, `permissions.*` once flipped, …) still emits an
+  event.
 - A mixed change (one restart-required key + one hot-reloadable key) still emits
   an event (the hot-reloadable part legitimately needs to refresh).
 - An unknown (non-schema) key change still emits, rather than being silently
@@ -507,6 +516,11 @@ Test status:
 - **Done** — `settingsWatcher.test.ts` `restart-required suppression` block
   covers all-suppressed (`env`, `security.auth.apiKey`), all-allowed
   (`ui.theme`), mixed, and unknown-key cases.
-- **Pending (with the schema flips)** — `settingsSchema.test.ts` assertions
-  pinning the two corrected `requiresRestart` values, and a watcher test
-  asserting `permissions.*` is no longer suppressed once flipped.
+- **Done (sub-task 3)** — `settingsSchema.test.ts` pins the MCP
+  `requiresRestart` values (`mcpServers` / `mcp.allowed` / `mcp.excluded` →
+  `false`; `mcp` / `mcp.serverCommand` → `true`), and `settingsWatcher.test.ts`
+  asserts an `mcpServers`-only and an `mcp.excluded`-only edit each still notify.
+- **Pending (with the unrelated schema flips)** — `settingsSchema.test.ts`
+  assertions pinning the two corrected `requiresRestart` values
+  (`modelProviders`, `permissions.*`), and a watcher test asserting
+  `permissions.*` is no longer suppressed once flipped.

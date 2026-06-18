@@ -146,6 +146,29 @@ describe('SettingsSchema', () => {
       expect(getSettingsSchema().plansDirectory.showInDialog).toBe(false);
     });
 
+    it('marks MCP reconcile inputs as hot-reloadable but startup-only MCP keys as restart-required (sub-task 3)', () => {
+      // These three feed the runtime reconcile (mcpServers is the server map;
+      // mcp.allowed / mcp.excluded are read by mcpGatingEqual), so they MUST be
+      // hot-reloadable — otherwise the SettingsWatcher suppresses MCP-only
+      // edits and registerMcpHotReload never fires for the advertised
+      // add/remove/restart/gating changes.
+      expect(getSettingsSchema().mcpServers.requiresRestart).toBe(false);
+      expect(getSettingsSchema().mcp.properties!.allowed.requiresRestart).toBe(
+        false,
+      );
+      expect(getSettingsSchema().mcp.properties!.excluded.requiresRestart).toBe(
+        false,
+      );
+      // serverCommand is consumed once at startup (not part of the reconcile
+      // input), so it stays restart-required. The mcp parent node also stays
+      // restart-required; the watcher resolves the longest-matching schema key,
+      // so the flipped leaves win for allowed/excluded edits regardless.
+      expect(
+        getSettingsSchema().mcp.properties!.serverCommand.requiresRestart,
+      ).toBe(true);
+      expect(getSettingsSchema().mcp.requiresRestart).toBe(true);
+    });
+
     it('should have unique categories', () => {
       const categories = new Set();
 
