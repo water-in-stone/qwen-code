@@ -61,7 +61,10 @@ export interface CreateDaemonSessionActionsArgs {
   getCreateSessionRequest: () => CreateSessionRequest;
   createDetachedSession: (
     workspaceCwd?: string,
-    overrides?: Pick<CreateSessionRequest, 'approvalMode' | 'sourceType'>,
+    overrides?: Pick<
+      CreateSessionRequest,
+      'approvalMode' | 'sourceType' | 'startIn'
+    >,
   ) => Promise<DaemonSessionClient>;
   getConnection: () => DaemonConnectionState;
   hasSessionActivePrompt: () => boolean;
@@ -617,6 +620,7 @@ export function createDaemonSessionActions({
 
     async createSession(options?: {
       workspaceCwd?: string;
+      startIn?: CreateSessionRequest['startIn'];
       approvalMode?: DaemonApprovalMode;
       sourceType?: string;
     }) {
@@ -629,6 +633,9 @@ export function createDaemonSessionActions({
         // an application failure aborts creation (this call rejects) rather than
         // leaving the session in a different mode than the caller requested.
         const requestOverrides = {
+          ...(options?.startIn !== undefined
+            ? { startIn: options.startIn }
+            : {}),
           ...(options?.approvalMode !== undefined
             ? { approvalMode: options.approvalMode }
             : {}),

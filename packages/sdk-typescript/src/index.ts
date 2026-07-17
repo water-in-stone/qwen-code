@@ -29,6 +29,7 @@ export {
   requireWorkspaceCwd,
   SseFramingError,
   type CreateSessionRequest,
+  type DaemonStartInMode,
   type DaemonApprovalMode,
   type DaemonApprovalModeChangedData,
   type DaemonApprovalModeChangedEvent,

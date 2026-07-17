@@ -66,8 +66,12 @@ export interface RewindResponse {
 }
 
 export interface BridgeSpawnRequest {
-  /** Absolute path to the workspace root the child inherits as cwd. */
+  /** Absolute path to the base workspace that owns routing/storage/listing. */
   workspaceCwd: string;
+  /** Absolute path used as the runtime cwd for the ACP child/session. */
+  executionCwd?: string;
+  /** One-shot system reminder prepended to the first prompt for this session. */
+  startupNotice?: string;
   /** Optional explicit model service id; falls back to settings default. */
   modelServiceId?: string;
   /**
@@ -99,6 +103,7 @@ export interface BridgeSpawnRequest {
 export interface BridgeSession {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd?: string;
   /** True if this attach reused an existing session under `sessionScope: 'single'`. */
   attached: boolean;
   /**
@@ -131,8 +136,10 @@ export interface BridgeSession {
 export interface BridgeRestoreSessionRequest {
   /** Session id to restore through ACP `session/load` or `session/resume`. */
   sessionId: string;
-  /** Absolute path to the workspace root the child inherits as cwd. */
+  /** Absolute path to the base workspace that owns routing/storage/listing. */
   workspaceCwd: string;
+  /** Absolute path used as the runtime cwd for the restored ACP child/session. */
+  executionCwd?: string;
   /** Optional echo of a daemon-issued client id for this session. */
   clientId?: string;
   /** Internal replay transport for `session/load`; defaults to bulk response. */
@@ -333,6 +340,7 @@ export type BridgePendingInteraction =
 export interface BridgeSessionSummary {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd?: string;
   createdAt: string;
   updatedAt?: string;
   displayName?: string;
@@ -541,6 +549,7 @@ export interface BridgeDaemonStatusLimits {
 export interface BridgeDaemonSessionDiagnostic {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd?: string;
   createdAt: string;
   displayName?: string;
   clientCount: number;

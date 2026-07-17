@@ -359,6 +359,7 @@ export interface DaemonSessionActions {
    */
   createSession(options?: {
     workspaceCwd?: string;
+    startIn?: CreateSessionRequest['startIn'];
     approvalMode?: DaemonApprovalMode;
     sourceType?: string;
   }): Promise<DaemonSession>;

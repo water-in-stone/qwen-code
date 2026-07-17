@@ -9,6 +9,7 @@ import * as path from 'node:path';
 import {
   APPROVAL_MODES,
   BTW_MAX_INPUT_LENGTH,
+  GitWorktreeService,
   GROUP_COLOR_OPTIONS,
   SessionService,
   SessionOrganizationError,
@@ -18,13 +19,17 @@ import {
   SessionTranscriptCursorCodec,
   SessionTranscriptReader,
   SessionTranscriptSnapshotUnavailableError,
+  restoreWorktreeContext,
   addDaemonRequestAttribute,
   runWithoutDebugLogSession,
+  writeWorktreeSession,
+  writeWorktreeSessionMarker,
   type ApprovalMode,
   type SessionGroupColor,
   type SessionGroupPresetColor,
   type SessionArchiveState,
 } from '@qwen-code/qwen-code-core';
+import { buildStartupWorktreeNotice } from '../../startup/worktreeStartup.js';
 import type { SessionArtifactInput } from '@qwen-code/acp-bridge/sessionArtifacts';
 import { parseSessionSource } from '@qwen-code/acp-bridge';
 import type { Application, Request, RequestHandler, Response } from 'express';
@@ -387,6 +392,103 @@ function parseOptionalApprovalMode(
     return null;
   }
   return rawApprovalMode as ApprovalMode;
+}
+
+type StartInMode = 'local' | 'worktree';
+
+interface PreparedWorktreeSession {
+  slug: string;
+  worktreePath: string;
+  branch: string;
+  repoRoot: string;
+  originalBranch: string;
+  originalHeadCommit: string;
+  created: boolean;
+}
+
+function parseStartInMode(
+  body: Record<string, unknown>,
+  res: Response,
+): StartInMode | null {
+  const raw = body['startIn'];
+  if (raw === undefined) return 'local';
+  if (raw === 'local' || raw === 'worktree') return raw;
+  res.status(400).json({
+    error: '`startIn` must be "local" or "worktree" when provided',
+    code: 'invalid_start_in',
+  });
+  return null;
+}
+
+async function prepareWorktreeSession(
+  workspaceCwd: string,
+): Promise<PreparedWorktreeSession> {
+  if (/[\\/]\.qwen[\\/]worktrees[\\/]/.test(workspaceCwd)) {
+    throw new Error(
+      `Cannot start a new worktree from inside another worktree: ${workspaceCwd}`,
+    );
+  }
+  const probe = new GitWorktreeService(workspaceCwd);
+  const gitCheck = await probe.checkGitAvailable();
+  if (!gitCheck.available) {
+    throw new Error(gitCheck.error ?? 'git is not available on PATH.');
+  }
+  const rawRepoRoot = await probe.getRepoTopLevel();
+  if (rawRepoRoot === null) {
+    throw new Error(
+      `${workspaceCwd} is not a git repository. Run git init first or choose a git workspace.`,
+    );
+  }
+  const repoRoot = path.resolve(rawRepoRoot);
+  const service =
+    repoRoot === workspaceCwd ? probe : new GitWorktreeService(repoRoot);
+  const [originalBranchRaw, originalHeadCommit] = await Promise.all([
+    service.getCurrentBranch().catch(() => undefined),
+    service.getCurrentCommitHash().catch(() => ''),
+  ]);
+  const slug = GitWorktreeService.generateAutoSlug();
+  const result = await service.createUserWorktree(slug);
+  if (!result.success || !result.worktree) {
+    throw new Error(result.error ?? 'failed to create worktree');
+  }
+  return {
+    slug,
+    worktreePath: path.resolve(result.worktree.path),
+    branch: result.worktree.branch,
+    repoRoot,
+    originalBranch:
+      originalBranchRaw && originalBranchRaw !== 'HEAD'
+        ? originalBranchRaw
+        : 'HEAD',
+    originalHeadCommit,
+    created: true,
+  };
+}
+
+async function persistDaemonWorktreeSession(
+  workspaceCwd: string,
+  sessionId: string,
+  worktree: PreparedWorktreeSession,
+): Promise<void> {
+  const service = new SessionService(workspaceCwd);
+  await writeWorktreeSessionMarker(worktree.worktreePath, sessionId);
+  await writeWorktreeSession(service.getWorktreeSessionPath(sessionId), {
+    slug: worktree.slug,
+    worktreePath: worktree.worktreePath,
+    worktreeBranch: worktree.branch,
+    originalCwd: worktree.repoRoot,
+    originalBranch: worktree.originalBranch,
+    originalHeadCommit: worktree.originalHeadCommit,
+  });
+}
+
+async function cleanupPreparedWorktree(
+  worktree: PreparedWorktreeSession | undefined,
+): Promise<void> {
+  if (!worktree?.created) return;
+  await new GitWorktreeService(worktree.repoRoot)
+    .removeUserWorktree(worktree.slug)
+    .catch(() => {});
 }
 
 export function registerSessionRoutes(
@@ -1185,6 +1287,8 @@ export function registerSessionRoutes(
     }
     const approvalMode = parseOptionalApprovalMode(body, res);
     if (approvalMode === null) return;
+    const startIn = parseStartInMode(body, res);
+    if (startIn === null) return;
     const source = parseSessionSource(body['sourceType'], body['sourceId']);
     if ('error' in source) {
       res.status(400).json({
@@ -1195,9 +1299,27 @@ export function registerSessionRoutes(
     }
     const clientId = parseClientIdHeader(req, res);
     if (clientId === null) return;
+    let preparedWorktree: PreparedWorktreeSession | undefined;
+    let freshSessionId: string | undefined;
     try {
+      if (startIn === 'worktree') {
+        preparedWorktree = await prepareWorktreeSession(workspaceCwd);
+      }
       const session = await runtime.bridge.spawnOrAttach({
         workspaceCwd,
+        ...(preparedWorktree
+          ? { executionCwd: preparedWorktree.worktreePath }
+          : {}),
+        ...(preparedWorktree
+          ? {
+              startupNotice: buildStartupWorktreeNotice({
+                slug: preparedWorktree.slug,
+                worktreePath: preparedWorktree.worktreePath,
+                branch: preparedWorktree.branch,
+                wasReattached: false,
+              }),
+            }
+          : {}),
         modelServiceId,
         ...(clientId !== undefined ? { clientId } : {}),
         ...(sessionScope !== undefined ? { sessionScope } : {}),
@@ -1207,6 +1329,19 @@ export function registerSessionRoutes(
           : {}),
         ...(source.sourceId !== undefined ? { sourceId: source.sourceId } : {}),
       });
+      if (!session.attached) {
+        freshSessionId = session.sessionId;
+      }
+      if (preparedWorktree && !session.attached) {
+        await persistDaemonWorktreeSession(
+          workspaceCwd,
+          session.sessionId,
+          preparedWorktree,
+        );
+      } else if (preparedWorktree) {
+        await cleanupPreparedWorktree(preparedWorktree);
+        preparedWorktree = undefined;
+      }
       // Client may have disconnected during the 1–3s spawn window. If
       // so, the response can't be delivered. The session is otherwise
       // orphaned (in `byId` / `defaultEntry` with no client knowing the
@@ -1263,6 +1398,8 @@ export function registerSessionRoutes(
             }
           } catch {
             // Best-effort cleanup; channel.exited will eventually reap.
+          } finally {
+            await cleanupPreparedWorktree(preparedWorktree);
           }
         } else {
           // When an attaching client disconnects
@@ -1284,6 +1421,12 @@ export function registerSessionRoutes(
       }
       res.status(200).json(session);
     } catch (err) {
+      if (freshSessionId !== undefined) {
+        await runtime.bridge
+          .killSession(freshSessionId, { requireZeroAttaches: true })
+          .catch(() => {});
+      }
+      await cleanupPreparedWorktree(preparedWorktree);
       sendBridgeError(res, err, { route: 'POST /session' });
     }
   });
@@ -1341,13 +1484,25 @@ export function registerSessionRoutes(
             // Recover the persisted parent lineage so the restored live entry
             // reports it (the bridge otherwise creates the entry without it, and
             // status calls would show a restored sub-session as top-level).
-            const metadata = await new SessionService(
-              workspaceCwd,
-            ).readCreationMetadata(sessionId);
+            const sessionService = new SessionService(workspaceCwd);
+            const metadata =
+              await sessionService.readCreationMetadata(sessionId);
+            const worktreeRestore = await restoreWorktreeContext(
+              sessionService.getWorktreeSessionPath(sessionId),
+              (error) => {
+                daemonLog?.warn('worktree sidecar restore failed', {
+                  sessionId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              },
+            );
+            const executionCwd =
+              worktreeRestore.session?.worktreePath ?? workspaceCwd;
             return action === 'load'
               ? await runtime.bridge.loadSession({
                   sessionId,
                   workspaceCwd,
+                  ...(executionCwd !== workspaceCwd ? { executionCwd } : {}),
                   historyReplay: 'response',
                   ...(historyPageSize !== undefined ? { historyPageSize } : {}),
                   ...(clientId !== undefined ? { clientId } : {}),
@@ -1357,6 +1512,7 @@ export function registerSessionRoutes(
               : await runtime.bridge.resumeSession({
                   sessionId,
                   workspaceCwd,
+                  ...(executionCwd !== workspaceCwd ? { executionCwd } : {}),
                   ...(clientId !== undefined ? { clientId } : {}),
                   ...(approvalMode !== undefined ? { approvalMode } : {}),
                   ...metadata,

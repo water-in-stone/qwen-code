@@ -150,6 +150,10 @@ function renderChatEditor(props: {
   availableModels?: Array<{ id: string; label?: string }>;
   onSelectMode?: (mode: string) => void;
   onSelectModel?: (model: string) => void;
+  startInMode?: 'local' | 'worktree';
+  startInWorktreeAvailable?: boolean;
+  startInWorktreeUnavailableReason?: string;
+  onStartInModeChange?: (mode: 'local' | 'worktree') => void;
   customization?: WebShellCustomization;
 }) {
   const {
@@ -198,6 +202,55 @@ function renderChatEditor(props: {
 
   return container;
 }
+
+describe('ChatEditor Start In selector', () => {
+  it('selects a worktree when the capability preflight is available', async () => {
+    const onStartInModeChange = vi.fn();
+    const container = renderChatEditor({
+      visibleToolbarActions: [],
+      startInMode: 'local',
+      startInWorktreeAvailable: true,
+      onStartInModeChange,
+    });
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-web-shell-start-in-button]')
+        ?.click();
+      await Promise.resolve();
+    });
+    const worktreeOption = [...document.querySelectorAll('button')].find(
+      (button) => button.textContent?.includes('New worktree'),
+    );
+    expect(worktreeOption).toBeDefined();
+
+    act(() => worktreeOption?.click());
+    expect(onStartInModeChange).toHaveBeenCalledWith('worktree');
+  });
+
+  it('keeps the worktree option visible but disabled with the preflight reason', async () => {
+    const reason = 'The workspace is not a git repository.';
+    const container = renderChatEditor({
+      visibleToolbarActions: [],
+      startInMode: 'local',
+      startInWorktreeAvailable: false,
+      startInWorktreeUnavailableReason: reason,
+      onStartInModeChange: vi.fn(),
+    });
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-web-shell-start-in-button]')
+        ?.click();
+      await Promise.resolve();
+    });
+    const worktreeOption = [...document.querySelectorAll('button')].find(
+      (button) => button.textContent?.includes('New worktree'),
+    ) as HTMLButtonElement | undefined;
+    expect(worktreeOption?.disabled).toBe(true);
+    expect(worktreeOption?.title).toBe(reason);
+  });
+});
 
 describe('ChatEditor composer tag icons', () => {
   it('renders built-in icons for top composer tags', () => {

@@ -1620,6 +1620,25 @@ describe('DaemonClient', () => {
       }
     });
 
+    it('forwards startIn when supplied', async () => {
+      const { fetch, calls } = recordingFetch(() =>
+        jsonResponse(200, {
+          sessionId: 's-1',
+          workspaceCwd: '/work/a',
+          attached: false,
+        }),
+      );
+      const client = new DaemonClient({ baseUrl: 'http://daemon', fetch });
+      await client.createOrAttachSession({
+        workspaceCwd: '/work/a',
+        startIn: 'worktree',
+      });
+      expect(JSON.parse(calls[0]!.body!)).toEqual({
+        cwd: '/work/a',
+        startIn: 'worktree',
+      });
+    });
+
     it('omits sessionScope from the body when the field is absent', async () => {
       // Backward-compat: a caller that doesn't set the field must not
       // surface a `sessionScope` key on the wire — old daemons reading

@@ -445,6 +445,7 @@ export interface DaemonStatusReport {
 export interface DaemonSession {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd?: string;
   /** True when an existing session was reused under sessionScope:single. */
   attached: boolean;
   /**
@@ -574,6 +575,7 @@ export type DaemonPendingInteraction =
 export interface DaemonSessionSummary {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd?: string;
   createdAt?: string;
   updatedAt?: string;
   displayName?: string;
@@ -1612,6 +1614,7 @@ export type DaemonPreflightKind =
   | 'workspace_dir'
   | 'ripgrep'
   | 'git'
+  | 'worktree'
   | 'npm'
   | 'auth'
   | 'mcp_discovery'

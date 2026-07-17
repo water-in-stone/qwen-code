@@ -2055,7 +2055,10 @@ export function DaemonSessionProvider(props: DaemonSessionProviderProps) {
         }),
         createDetachedSession: (
           workspaceCwd?: string,
-          overrides?: Pick<CreateSessionRequest, 'approvalMode' | 'sourceType'>,
+          overrides?: Pick<
+            CreateSessionRequest,
+            'approvalMode' | 'sourceType' | 'startIn'
+          >,
         ) => {
           const client =
             workspaceClientRef.current ??
@@ -2075,6 +2078,9 @@ export function DaemonSessionProvider(props: DaemonSessionProviderProps) {
               : {}),
             ...(overrides?.sourceType !== undefined
               ? { sourceType: overrides.sourceType }
+              : {}),
+            ...(overrides?.startIn !== undefined
+              ? { startIn: overrides.startIn }
               : {}),
           };
           const requestClientId = clientId

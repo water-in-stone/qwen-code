@@ -1262,6 +1262,7 @@ export type ServePreflightKind =
   | 'workspace_dir'
   | 'ripgrep'
   | 'git'
+  | 'worktree'
   | 'npm'
   | 'auth'
   | 'mcp_discovery'

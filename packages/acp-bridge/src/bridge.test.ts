@@ -4066,6 +4066,95 @@ describe('createAcpSessionBridge', () => {
     await bridge.shutdown();
   });
 
+  it('keys single-scope attach slots and ACP channels by executionCwd', async () => {
+    const executionCwds: string[] = [];
+    const handles: ChannelHandle[] = [];
+    const factory: ChannelFactory = async (cwd) => {
+      executionCwds.push(cwd);
+      const h = makeChannel({ sessionIdPrefix: `s${handles.length}` });
+      handles.push(h);
+      return h.channel;
+    };
+    const bridge = makeBridge({
+      sessionScope: 'single',
+      channelFactory: factory,
+    });
+    const worktreeA = path.join(WS_A, '.qwen/worktrees/wt-a');
+    const worktreeB = path.join(WS_A, '.qwen/worktrees/wt-b');
+
+    const local = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+    const worktree = await bridge.spawnOrAttach({
+      workspaceCwd: WS_A,
+      executionCwd: worktreeA,
+    });
+    const worktreeAgain = await bridge.spawnOrAttach({
+      workspaceCwd: WS_A,
+      executionCwd: worktreeA,
+    });
+    const otherWorktree = await bridge.spawnOrAttach({
+      workspaceCwd: WS_A,
+      executionCwd: worktreeB,
+    });
+
+    expect(local.sessionId).not.toBe(worktree.sessionId);
+    expect(worktreeAgain.sessionId).toBe(worktree.sessionId);
+    expect(worktreeAgain.attached).toBe(true);
+    expect(otherWorktree.sessionId).not.toBe(worktree.sessionId);
+    expect(executionCwds).toEqual([WS_A, worktreeA, worktreeB]);
+    expect(handles).toHaveLength(3);
+    expect(handles[1]?.agent.newSessionCalls[0]?.cwd).toBe(worktreeA);
+    expect(handles[2]?.agent.newSessionCalls[0]?.cwd).toBe(worktreeB);
+    expect(worktree.workspaceCwd).toBe(WS_A);
+    expect(worktree.executionCwd).toBe(worktreeA);
+    expect(bridge.listWorkspaceSessions(WS_A).map((s) => s.sessionId)).toEqual(
+      expect.arrayContaining([
+        local.sessionId,
+        worktree.sessionId,
+        otherWorktree.sessionId,
+      ]),
+    );
+
+    await bridge.shutdown();
+  });
+
+  it('prepends a startup notice to the first agent prompt only', async () => {
+    const prompts: PromptRequest[] = [];
+    const handle = makeChannel({
+      promptImpl: (prompt) => {
+        prompts.push(prompt);
+        return { stopReason: 'end_turn' };
+      },
+    });
+    const bridge = makeBridge({
+      channelFactory: async () => handle.channel,
+    });
+
+    const session = await bridge.spawnOrAttach({
+      workspaceCwd: WS_A,
+      startupNotice: 'Active worktree at /work/a/.qwen/worktrees/wt-a',
+    });
+    await bridge.sendPrompt(session.sessionId, {
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'first' }],
+    });
+    await bridge.sendPrompt(session.sessionId, {
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'second' }],
+    });
+
+    expect(prompts[0]?.prompt[0]).toMatchObject({
+      type: 'text',
+      text: expect.stringContaining('<system-reminder>'),
+    });
+    expect(prompts[0]?.prompt[1]).toMatchObject({
+      type: 'text',
+      text: 'first',
+    });
+    expect(prompts[1]?.prompt).toEqual([{ type: 'text', text: 'second' }]);
+
+    await bridge.shutdown();
+  });
+
   it('symmetric mixed-scope leak: single-first does NOT trap a later thread call into the single slot', async () => {
     // Mirror of the daemon-default-`'single'` + thread-first leak
     // regression: under daemon-default-`'thread'` an explicit `'single'`
@@ -9449,6 +9538,28 @@ describe('createAcpSessionBridge', () => {
       expect(first.value?.originatorClientId).toBe(session.clientId);
 
       abort.abort();
+      await bridge.shutdown();
+      shellSpy.mockRestore();
+    });
+
+    it('executes shell commands in the session executionCwd', async () => {
+      const shellSpy = mockShellExecute('hello\n');
+      const worktreeCwd = path.join(WS_A, '.qwen/worktrees/wt-shell');
+      const bridge = makeBridge({
+        sessionShellCommandEnabled: true,
+        channelFactory: async () => makeChannel().channel,
+      });
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        executionCwd: worktreeCwd,
+      });
+
+      await bridge.executeShellCommand(session.sessionId, 'pwd', undefined, {
+        clientId: session.clientId,
+      });
+
+      expect(shellSpy.mock.calls[0]?.slice(0, 2)).toEqual(['pwd', worktreeCwd]);
+
       await bridge.shutdown();
       shellSpy.mockRestore();
     });
@@ -15092,6 +15203,45 @@ describe('channelIdleTimeoutMs', () => {
       expect(handle.killed).toBe(false);
 
       await bridge.closeSession(session2.sessionId);
+      await bridge.shutdown();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reaps idle execution-cwd channels independently', async () => {
+    vi.useFakeTimers();
+    try {
+      const handles = new Map<string, ChannelHandle>();
+      const bridge = makeBridge({
+        channelFactory: async (cwd) => {
+          const handle = makeChannel();
+          handles.set(cwd, handle);
+          return handle.channel;
+        },
+        channelIdleTimeoutMs: 5_000,
+      });
+      const worktreeCwd = path.join(WS_A, '.qwen', 'worktrees', 'idle');
+      const local = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sessionScope: 'thread',
+      });
+      const worktree = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        executionCwd: worktreeCwd,
+        sessionScope: 'thread',
+      });
+
+      await bridge.closeSession(local.sessionId);
+      await vi.advanceTimersByTimeAsync(3_000);
+      await bridge.closeSession(worktree.sessionId);
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(handles.get(WS_A)?.killed).toBe(true);
+      expect(handles.get(worktreeCwd)?.killed).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(handles.get(worktreeCwd)?.killed).toBe(true);
       await bridge.shutdown();
     } finally {
       vi.useRealTimers();

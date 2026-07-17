@@ -43,6 +43,10 @@ type ChatEditorTestProps = {
   placeholderText?: string;
   workspaces?: Array<{ id: string; cwd: string }>;
   atWorkspaceCwd?: string;
+  startInMode?: 'local' | 'worktree';
+  startInWorktreeAvailable?: boolean;
+  startInWorktreeUnavailableReason?: string;
+  onStartInModeChange?: (mode: 'local' | 'worktree') => void;
 };
 
 const {
@@ -78,10 +82,12 @@ const {
     catchingUp: false,
   };
   const loadSkillsStatus = vi.fn().mockResolvedValue({ skills: [] });
+  const loadPreflight = vi.fn().mockResolvedValue(null);
   const workspaceClient = {
     workspaceByCwd: vi.fn(() => ({
       workspaceGit: vi.fn().mockResolvedValue({ branch: 'main' }),
       workspaceSkills: loadSkillsStatus,
+      workspacePreflight: loadPreflight,
     })),
   };
   return {
@@ -115,7 +121,7 @@ const {
     mockWorkspaceActions: {
       loadSkillsStatus,
       loadProviders: vi.fn().mockResolvedValue({ current: null }),
-      loadPreflight: vi.fn().mockResolvedValue(null),
+      loadPreflight,
       loadEnv: vi.fn().mockResolvedValue(null),
       loadMcpStatus: vi.fn().mockResolvedValue({ servers: [] }),
       loadMcpTools: vi.fn().mockResolvedValue([]),
@@ -859,6 +865,7 @@ beforeEach(() => {
   mockConnection.skills = [];
   mockConnection.loadingTranscript = false;
   mockConnection.catchingUp = false;
+  mockConnection.capabilities = { qwenCodeVersion: '1.2.3', features: [] };
   mockWorkspace.capabilities = {
     workspaces: [{ id: 'primary', cwd: '/workspace', primary: true }],
   };
@@ -1334,6 +1341,49 @@ describe('App session callbacks', () => {
     expect(container.textContent).not.toContain(
       'Current session does not exist',
     );
+  });
+
+  it('uses the selected worktree for the first fresh prompt and resets the selector', async () => {
+    mockConnection.sessionId = undefined;
+    mockConnection.capabilities = {
+      qwenCodeVersion: '1.2.3',
+      features: ['session_start_in_worktree'],
+    };
+    mockWorkspaceActions.loadPreflight.mockResolvedValue({
+      v: 1,
+      workspaceCwd: '/tmp/project',
+      initialized: true,
+      acpChannelLive: false,
+      cells: [{ kind: 'worktree', locality: 'daemon', status: 'ok' }],
+    });
+
+    const { container } = renderApp();
+    await flush();
+
+    expect(testState.latestChatEditorProps?.startInWorktreeAvailable).toBe(
+      true,
+    );
+    await act(async () => {
+      testState.latestChatEditorProps?.onStartInModeChange?.('worktree');
+      await Promise.resolve();
+    });
+    expect(testState.latestChatEditorProps?.startInMode).toBe('worktree');
+
+    await clickSubmit(container);
+
+    expect(mockSessionActions.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ startIn: 'worktree' }),
+    );
+    expect(testState.latestChatEditorProps?.startInMode).toBe('local');
+  });
+
+  it('does not expose the Start In selector for an active session', async () => {
+    renderApp();
+    await flush();
+
+    expect(
+      testState.latestChatEditorProps?.onStartInModeChange,
+    ).toBeUndefined();
   });
 
   it('does not show missing-session state while connecting', async () => {

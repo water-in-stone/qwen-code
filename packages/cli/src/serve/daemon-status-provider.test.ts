@@ -124,6 +124,7 @@ describe('DaemonWorkspaceService — daemon-host status provider integration', (
         'workspace_dir',
         'ripgrep',
         'git',
+        'worktree',
         'npm',
       ]),
     );
@@ -217,5 +218,20 @@ describe('DaemonWorkspaceService — daemon-host status provider integration', (
       status: 'error',
     });
     expect(status.errors![0]!.error).toBeTruthy();
+  });
+
+  it('includes a daemon-local worktree preflight cell for UI gating', async () => {
+    const service = makeWorkspaceServiceWithProvider({
+      isChannelLive: () => false,
+    });
+
+    const status = await service.getWorkspacePreflightStatus(CTX);
+    const worktree = status.cells.find((cell) => cell.kind === 'worktree');
+
+    expect(worktree).toBeDefined();
+    expect(worktree).toMatchObject({
+      kind: 'worktree',
+      locality: 'daemon',
+    });
   });
 });

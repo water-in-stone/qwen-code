@@ -1,6 +1,7 @@
 import {
   DAEMON_APPROVAL_MODES,
   type DaemonApprovalMode,
+  type DaemonStartInMode,
 } from '@qwen-code/webui/daemon-react-sdk';
 import { WEB_SHELL_SESSION_SOURCE_TYPE } from '../constants/sessions';
 
@@ -9,6 +10,7 @@ const SESSION_CREATED_CALLBACK_TIMEOUT_MS = 30_000;
 type PromptSessionActions = {
   createSession: (options?: {
     workspaceCwd?: string;
+    startIn?: DaemonStartInMode;
     approvalMode?: DaemonApprovalMode;
     sourceType?: string;
   }) => Promise<{ sessionId: string }>;
@@ -27,6 +29,7 @@ export async function createAndAttachSessionForPrompt({
   modelId,
   modeId,
   workspaceCwd,
+  startIn,
   onSessionCreated,
   onSessionAllocated,
   getCurrentSessionId,
@@ -36,6 +39,7 @@ export async function createAndAttachSessionForPrompt({
   modelId?: string;
   modeId?: string;
   workspaceCwd?: string;
+  startIn?: DaemonStartInMode;
   onSessionCreated?: (sessionId: string) => Promise<void> | void;
   onSessionAllocated?: (sessionId: string) => void;
   getCurrentSessionId: () => string | undefined;
@@ -52,6 +56,7 @@ export async function createAndAttachSessionForPrompt({
   const { sessionId } = await sessionActions.createSession({
     workspaceCwd,
     sourceType: WEB_SHELL_SESSION_SOURCE_TYPE,
+    ...(startIn ? { startIn } : {}),
     ...(approvalMode ? { approvalMode } : {}),
   });
   onSessionAllocated?.(sessionId);

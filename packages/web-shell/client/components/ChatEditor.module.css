@@ -1108,6 +1108,15 @@
   background: var(--accent);
 }
 
+.dropdownItem:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dropdownItem:disabled:hover {
+  background: transparent;
+}
+
 .dropdownItemActive {
   color: var(--foreground);
   background: var(--accent);

@@ -427,6 +427,8 @@ export function isDaemonTurnError(error: unknown): error is DaemonTurnError {
   );
 }
 
+export type DaemonStartInMode = 'local' | 'worktree';
+
 export interface CreateSessionRequest {
   /**
    * Workspace path the daemon must have registered. When
@@ -439,6 +441,12 @@ export interface CreateSessionRequest {
    * `400 workspace_mismatch` `DaemonHttpError`.
    */
   workspaceCwd?: string;
+  /**
+   * Execution context for a fresh session. `local` keeps today's behavior;
+   * `worktree` asks the daemon to create an isolated git worktree and run the
+   * session there.
+   */
+  startIn?: DaemonStartInMode;
   modelServiceId?: string;
   /**
    * Per-request session-scope override. The production daemon defaults
@@ -1957,6 +1965,7 @@ export class DaemonClient {
         body: JSON.stringify({
           cwd: req.workspaceCwd,
           ...(req.modelServiceId ? { modelServiceId: req.modelServiceId } : {}),
+          ...(req.startIn !== undefined ? { startIn: req.startIn } : {}),
           // `!== undefined` (not truthy) so a buggy caller passing
           // `sessionScope: '' | null` doesn't get the field silently
           // erased on the wire — let the daemon's `400

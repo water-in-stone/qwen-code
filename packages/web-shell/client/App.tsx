@@ -27,6 +27,7 @@ import {
   useWorkspaceEventSignals,
   type DaemonWorkspaceActions,
   type DaemonSessionNotice,
+  type DaemonStartInMode,
   type DaemonStreamingState,
 } from '@qwen-code/webui/daemon-react-sdk';
 import { isDaemonTurnError } from '@qwen-code/sdk/daemon';
@@ -283,6 +284,9 @@ function TodoContextsProvider({
 
 const MODES_CYCLE = DAEMON_APPROVAL_MODES;
 const MAX_TOASTS = 4;
+const START_IN_WORKTREE_FEATURE = 'session_start_in_worktree';
+const DEFAULT_WORKTREE_UNAVAILABLE_REASON =
+  'Worktree sessions are unavailable in this workspace.';
 const DEFAULT_REVIEW_PANEL_WIDTH = 760;
 const MIN_ARTIFACT_PANEL_WIDTH = 320;
 const MIN_CHAT_PANE_WIDTH_WITH_ARTIFACT_PANEL = 500;
@@ -1257,6 +1261,16 @@ export function App({
   >(undefined);
   const selectedWorkspaceCwdRef = useRef(selectedWorkspaceCwd);
   selectedWorkspaceCwdRef.current = selectedWorkspaceCwd;
+  const [startInMode, setStartInMode] = useState<DaemonStartInMode>('local');
+  const startInModeRef = useRef(startInMode);
+  startInModeRef.current = startInMode;
+  const [worktreePreflightState, setWorktreePreflightState] = useState<{
+    available: boolean;
+    reason: string;
+  }>({
+    available: false,
+    reason: DEFAULT_WORKTREE_UNAVAILABLE_REASON,
+  });
   const [selectedWorkspaceGitBranch, setSelectedWorkspaceGitBranch] = useState<
     string | undefined
   >(undefined);
@@ -1319,6 +1333,82 @@ export function App({
       return [...withoutDuplicate, toast].slice(-MAX_TOASTS);
     });
   }, []);
+  const startInWorktreeCapability =
+    connection.capabilities?.features?.includes(START_IN_WORKTREE_FEATURE) ??
+    false;
+  const startInWorktreeAvailable =
+    startInWorktreeCapability && worktreePreflightState.available;
+  const startInWorktreeAvailableRef = useRef(startInWorktreeAvailable);
+  startInWorktreeAvailableRef.current = startInWorktreeAvailable;
+  const startInWorktreeUnavailableReason = startInWorktreeCapability
+    ? worktreePreflightState.reason
+    : 'The connected daemon does not support worktree sessions.';
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!startInWorktreeCapability) {
+      setStartInMode('local');
+      setWorktreePreflightState({
+        available: false,
+        reason: 'The connected daemon does not support worktree sessions.',
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const primaryWorkspaceCwd = workspaces.find((entry) => entry.primary)?.cwd;
+    const preflightWorkspaceCwd =
+      lockedWorkspaceCwd ?? selectedWorkspaceCwd ?? primaryWorkspaceCwd;
+    if (!preflightWorkspaceCwd) {
+      setStartInMode('local');
+      setWorktreePreflightState({
+        available: false,
+        reason: DEFAULT_WORKTREE_UNAVAILABLE_REASON,
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setWorktreePreflightState({
+      available: false,
+      reason: DEFAULT_WORKTREE_UNAVAILABLE_REASON,
+    });
+    workspace.client
+      .workspaceByCwd(preflightWorkspaceCwd)
+      .workspacePreflight()
+      .then((preflight) => {
+        if (cancelled) return;
+        const cell = preflight.cells.find((item) => item.kind === 'worktree');
+        if (cell?.status !== 'ok') setStartInMode('local');
+        setWorktreePreflightState({
+          available: cell?.status === 'ok',
+          reason:
+            cell?.status === 'ok'
+              ? ''
+              : cell?.hint || DEFAULT_WORKTREE_UNAVAILABLE_REASON,
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setStartInMode('local');
+        setWorktreePreflightState({
+          available: false,
+          reason: DEFAULT_WORKTREE_UNAVAILABLE_REASON,
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    lockedWorkspaceCwd,
+    selectedWorkspaceCwd,
+    startInWorktreeCapability,
+    workspace.client,
+    workspaces,
+  ]);
 
   const messages = useMessages(t);
   const messagesRef = useRef(messages);
@@ -2653,6 +2743,11 @@ export function App({
         currentModelRef.current || connectionRef.current.currentModel;
       const modeId =
         currentModeRef.current || connectionRef.current.currentMode;
+      const startIn =
+        startInModeRef.current === 'worktree' &&
+        startInWorktreeAvailableRef.current
+          ? 'worktree'
+          : 'local';
       const primaryWorkspaceCwd = workspaces.find(
         (entry) => entry.primary,
       )?.cwd;
@@ -2665,16 +2760,16 @@ export function App({
           lockedWorkspaceCwd ??
           selectedWorkspaceCwdRef.current ??
           primaryWorkspaceCwd,
+        startIn,
         onSessionCreated: onSessionCreatedRef.current,
         onSessionAllocated: (sessionId) => {
           preparingSessionIdRef.current = sessionId;
         },
         getCurrentSessionId: () => connectionRef.current.sessionId,
       });
-      // One-shot: the picker targets only the *next* new session, so clear
-      // it after creation. The next new chat defaults back to the primary
-      // workspace unless the user picks one again.
+      // One-shot: these pickers target only the next fresh session.
       setSelectedWorkspaceCwd(undefined);
+      setStartInMode('local');
     })();
     createSessionPromiseRef.current = promise;
     const clearPreparation = () => {
@@ -7006,6 +7101,14 @@ export function App({
                           onDismissFollowup={onDismissFollowup}
                           composerInput={composerInput}
                           composerInputVersion={composerInputVersion}
+                          startInMode={startInMode}
+                          startInWorktreeAvailable={startInWorktreeAvailable}
+                          startInWorktreeUnavailableReason={
+                            startInWorktreeUnavailableReason
+                          }
+                          onStartInModeChange={
+                            connection.sessionId ? undefined : setStartInMode
+                          }
                           placeholderText={composerPlaceholderText}
                         />
                       </div>

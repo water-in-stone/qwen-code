@@ -330,22 +330,20 @@ function extractLoadReplayResponse(state: BridgeSessionState): {
 
 interface ChannelInfo {
   id: string;
+  executionCwd: string;
   channel: AcpChannel;
   connection: ClientSideConnection;
   /** Shared BridgeClient — its methods route ACP params by sessionId. */
   client: BridgeClient;
-  // One bridge owns one workspace runtime, so module-scope `boundWorkspace` is
-  // the source of truth and every channel in this bridge inherits it.
-  // Per-channel storage would suggest variance the bridge doesn't allow;
-  // keeping it out makes the runtime boundary visible at the type level.
+  // One bridge owns one base workspace. `boundWorkspace` remains the ownership
+  // source of truth while `executionCwd` identifies this channel's runtime.
   /**
    * Live session ids multiplexed on this channel. Updated when
    * `doSpawn` registers a new session and when `killSession` /
    * `channel.exited` removes one. When the set drops to empty under
    * `killSession`, the channel is marked `isDying = true` and its
-   * `channel.kill()` is awaited; `channelInfo` itself is left
-   * pointing at the dying channel until `channel.exited` fires (see
-   * BkUyD invariant on `isDying` below).
+   * `channel.kill()` is awaited; the execution-cwd attach-target map keeps
+   * pointing at the dying channel until `channel.exited` fires.
    */
   sessionIds: Set<string>;
   /**
@@ -388,6 +386,7 @@ interface ChannelInfo {
   childRssBytes?: number;
   childCpuPercent?: number;
   childResourceAt?: number;
+  idleTimer?: ReturnType<typeof setTimeout>;
   /**
    * MUST be set to `true` synchronously by any teardown path BEFORE
    * awaiting `channel.kill()`. `ensureChannel` treats a dying channel
@@ -408,7 +407,7 @@ interface ChannelInfo {
    *      after the delete).
    *   5. `shutdown`: bulk-mark every entry in `aliveChannels`.
    *
-   * **BkUyD invariant (why we don't clear `channelInfo` here)**:
+   * **BkUyD invariant (why we don't clear the attach target here)**:
    * `killAllSync` must still find the channel during the SIGTERM
    * grace window to fire SIGKILL on `process.exit(1)`. `aliveChannels`
    * holds the dying entry until `channel.exited` fires (OS-level
@@ -422,6 +421,8 @@ interface ChannelInfo {
 interface SessionEntry {
   sessionId: string;
   workspaceCwd: string;
+  executionCwd: string;
+  startupNotice?: string;
   createdAt: string;
   displayName?: string;
   /** Id of the session that spawned this one (via `create_sub_session`).
@@ -904,6 +905,29 @@ function echoPromptToSessionBus(
   }
 }
 
+function consumeStartupNotice(entry: SessionEntry): string | undefined {
+  const notice = entry.startupNotice;
+  delete entry.startupNotice;
+  return notice;
+}
+
+function prependSystemReminder(
+  req: PromptRequest,
+  notice: string | undefined,
+): PromptRequest {
+  if (!notice) return req;
+  return {
+    ...req,
+    prompt: [
+      {
+        type: 'text',
+        text: `<system-reminder>\n${notice}\n</system-reminder>\n\n`,
+      },
+      ...req.prompt,
+    ],
+  };
+}
+
 /**
  * Publish a `prompt_cancelled` event to the session bus so peer SSE
  * subscribers observe the cancel as a first-class event instead of
@@ -1360,28 +1384,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
   const persistApprovalMode = opts.persistApprovalMode;
   const telemetry = opts.telemetry ?? NOOP_BRIDGE_TELEMETRY;
 
-  // Per-workspace bridge model: the bridge hosts AT MOST one
-  // ATTACH-AVAILABLE channel and one default attach-target entry.
-  // Multi-session multiplexing happens through `channelInfo.sessionIds`;
-  // the `defaultEntry` slot is the FIRST session created (the one a
-  // same-workspace attach under `single` scope reuses). Thread-scope
-  // sessions add to `byId` but don't displace `defaultEntry`.
-  let defaultEntry: SessionEntry | undefined;
-  // `channelInfo` is the SINGLE attach-available channel. Cleared
-  // ONLY by the `channel.exited` handler (see below) when the OS
-  // reaps the underlying child process. Teardown initiators
-  // (`killSession` last-session-leaving, `doSpawn`-newSession-failure
-  // on an empty channel, `ensureChannel` init-failure /
-  // late-shutdown, `shutdown`) set `isDying = true` but LEAVE
-  // `channelInfo` pointing at the dying channel until OS reap — that
-  // asymmetry IS the BkUyD invariant. It lets `killAllSync` reach a
-  // mid-SIGTERM-grace channel through `aliveChannels` while a
-  // concurrent `spawnOrAttach` can already start spawning a fresh
-  // replacement (which overwrites `channelInfo` when its
-  // handshake completes). Race-aware code paths (`ensureChannel`,
-  // `killAllSync`) gate on `isDying` rather than presence; see
-  // `ChannelInfo.isDying` for the per-set-site rationale.
-  let channelInfo: ChannelInfo | undefined;
+  // Attach targets and ACP channels are keyed by runtime cwd. A local session
+  // and a worktree session share the same base workspace owner, but must never
+  // attach to the same ACP child.
+  const defaultEntriesByExecutionCwd = new Map<string, SessionEntry>();
+  const channelInfoByExecutionCwd = new Map<string, ChannelInfo>();
   let workspaceMcpStatusCache: ServeWorkspaceMcpStatus | undefined;
   const workspaceMcpToolsCache = new Map<
     string,
@@ -1391,8 +1398,6 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     string,
     ServeWorkspaceMcpResourcesStatus
   >();
-  let idleTimer: ReturnType<typeof setTimeout> | undefined;
-
   const sessionReapIntervalMs = resolvePositiveFiniteMs(
     opts.sessionReapIntervalMs,
     DEFAULT_SESSION_REAP_INTERVAL_MS,
@@ -1422,10 +1427,13 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     return raw > 0 && Number.isFinite(raw) ? Math.min(raw, 2_147_483_647) : 0;
   }
 
-  function cancelIdleTimer(): void {
-    if (idleTimer !== undefined) {
-      clearTimeout(idleTimer);
-      idleTimer = undefined;
+  function cancelIdleTimer(ci?: ChannelInfo): void {
+    const channels = ci ? [ci] : aliveChannels;
+    for (const info of channels) {
+      if (info.idleTimer !== undefined) {
+        clearTimeout(info.idleTimer);
+        info.idleTimer = undefined;
+      }
     }
   }
 
@@ -1457,9 +1465,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       await killChannelWithLog(ci, context);
       return;
     }
-    cancelIdleTimer();
-    idleTimer = setTimeout(() => {
-      idleTimer = undefined;
+    cancelIdleTimer(ci);
+    ci.idleTimer = setTimeout(() => {
+      ci.idleTimer = undefined;
       if (hasNoChannelWork(ci)) {
         writeStderrLine(
           `qwen serve: idle timeout (${timeoutMs}ms) expired, killing channel`,
@@ -1467,7 +1475,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         void killChannelWithLog(ci, 'idle timeout');
       }
     }, timeoutMs);
-    idleTimer.unref();
+    ci.idleTimer.unref();
   }
 
   function hasNoChannelWork(
@@ -1603,25 +1611,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     }
   }
 
-  // BkUyD: superset of `channelInfo` covering channels
-  // that are dying but not yet OS-reaped. `killSession` /
-  // `doSpawn`-newSession-failure / `shutdown` mark a channel as
-  // `isDying` and start its async kill; meanwhile a concurrent
-  // `spawnOrAttach` can spawn a FRESH channel and reassign
-  // `channelInfo`. Without this set, the dying channel becomes
-  // unreachable — a double-Ctrl+C arriving mid-grace would call
-  // `killAllSync()`, find only the fresh channel in `channelInfo`,
-  // force-kill it, and `process.exit(1)` would orphan the dying one
-  // whose SIGTERM hadn't yet completed. The set is the OS-level
-  // "still alive" source of truth: entries are added when a channel
-  // is created and removed when its `channel.exited` resolves.
-  // `killAllSync` iterates THIS set to fire SIGKILL on every alive
-  // child regardless of whether it's still the attach target.
+  // Superset of the attach-target map covering channels that are dying but
+  // not yet OS-reaped. `killAllSync` uses this set so every child remains
+  // reachable throughout its SIGTERM grace period.
   const aliveChannels = new Set<ChannelInfo>();
-  // Coalesces a concurrent second `ensureChannel()` call onto the
-  // first one's spawn so we never create two children for the same
-  // daemon. Cleared in the `finally` of the creator.
-  let inFlightChannelSpawn: Promise<ChannelInfo> | undefined;
+  // Coalesces channel spawns per runtime cwd.
+  const inFlightChannelSpawns = new Map<string, Promise<ChannelInfo>>();
   const byId = new Map<string, SessionEntry>();
   const generationRequests = new Map<
     string,
@@ -1649,6 +1644,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     return {
       sessionId: entry.sessionId,
       workspaceCwd: entry.workspaceCwd,
+      ...(entry.executionCwd !== entry.workspaceCwd
+        ? { executionCwd: entry.executionCwd }
+        : {}),
       createdAt: entry.createdAt,
       displayName: entry.displayName,
       ...(entry.parentSessionId
@@ -1740,11 +1738,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
 
   // Coalesces concurrent `spawnOrAttach` calls under single-scope and
   // tracks in-progress thread-scope spawns for shutdown to await.
-  // Single-scope uses the workspaceKey as the dedup key (at most one
-  // entry; concurrent callers pass the `defaultEntry` check together
-  // and coalesce here). Thread-scope uses `workspaceKey#uuid` so
-  // simultaneous calls don't collide while still being awaitable from
-  // `shutdown()`.
+  // Single-scope uses workspace + execution cwd as the dedup key. Thread-scope
+  // adds a uuid so simultaneous calls don't collide while remaining awaitable
+  // from `shutdown()`.
   const inFlightSpawns = new Map<string, Promise<BridgeSession>>();
 
   interface InFlightRestore {
@@ -1852,21 +1848,24 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
   };
 
   /**
-   * Get-or-create the daemon's single `qwen --acp` channel. N sessions
-   * multiplex onto it via `connection.newSession()`. Concurrent callers
-   * coalesce through `inFlightChannelSpawn` so we never spawn two
-   * children. Wires up the one-and-only `channel.exited` cleanup on
-   * first creation so the late-arriving event tears down ALL
-   * multiplexed sessions.
+   * Get or create the `qwen --acp` channel for an execution cwd. Sessions with
+   * the same runtime cwd multiplex onto it via `connection.newSession()`;
+   * concurrent callers coalesce through `inFlightChannelSpawns`.
    */
-  async function ensureChannel(): Promise<ChannelInfo> {
+  async function ensureChannel(
+    executionCwd = boundWorkspace,
+  ): Promise<ChannelInfo> {
     // Skip a channel that's marked dying — its underlying transport is
     // mid-SIGTERM-or-already-dead and `connection.newSession()` on it
     // would either hang or land the caller with a sessionId that
     // immediately 404s on every follow-up.
-    cancelIdleTimer();
-    if (channelInfo && !channelInfo.isDying) return channelInfo;
-    if (inFlightChannelSpawn) return await inFlightChannelSpawn;
+    const current = channelInfoByExecutionCwd.get(executionCwd);
+    if (current && !current.isDying) {
+      cancelIdleTimer(current);
+      return current;
+    }
+    const inFlight = inFlightChannelSpawns.get(executionCwd);
+    if (inFlight) return await inFlight;
 
     const promise = (async () => {
       const acpChannelId = randomUUID();
@@ -1877,7 +1876,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           'qwen-code.daemon.channel.reused': false,
           'qwen-code.daemon.acp_channel.id': acpChannelId,
         },
-        async () => await channelFactory(boundWorkspace, childEnvOverrides),
+        async () => await channelFactory(executionCwd, childEnvOverrides),
       );
       const sessionIds = new Set<string>();
       const client = new BridgeClient(
@@ -1889,7 +1888,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // instead of throwing. Surface that ambiguity loudly.
         (sessionId) => {
           if (sessionId) return byId.get(sessionId);
-          if (channelInfo && channelInfo.sessionIds.size > 1) {
+          const currentInfo = channelInfoByExecutionCwd.get(executionCwd);
+          if (currentInfo && currentInfo.sessionIds.size > 1) {
             throw new Error(
               'BridgeClient: ACP call without sessionId on a ' +
                 'multi-session channel cannot be routed — workspace=' +
@@ -1970,16 +1970,17 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
 
       // Add to `aliveChannels` + register the `channel.exited` handler
       // BEFORE the `initialize` handshake: the agent child exists from
-      // the moment `channelFactory(boundWorkspace)` returns, so a
+      // the moment `channelFactory(executionCwd)` returns, so a
       // `killAllSync()` during the handshake window (up to
       // `initTimeoutMs`, default 10s) must find it to avoid orphaning
       // on `process.exit(1)`. Init-failure / child-crash / late-shutdown
       // all converge on the same cleanup path via the handler below.
-      // `channelInfo` (the attach target) is assigned only AFTER
+      // The execution-cwd attach target is assigned only AFTER
       // initialize succeeds so callers don't attach to a still-
       // handshaking channel.
       const info: ChannelInfo = {
         id: acpChannelId,
+        executionCwd,
         channel,
         connection,
         client,
@@ -1996,30 +1997,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         handshakeComplete: false,
       };
       aliveChannels.add(info);
-      // Belt-and-suspenders leak detection. The set is intentionally
-      // multi-entry to cover the `killSession`-then-`spawnOrAttach`
-      // overlap window (size 2 is legitimate: one dying + one fresh
-      // attach-target). Anything higher implies a `channel.exited`
-      // handler never fired for some prior channel — a real leak we'd
-      // otherwise notice only as gradually-growing RSS over hours.
-      // The warning surfaces it the moment it happens. Threshold is
-      // 2 because that's the design ceiling; bumping it requires
-      // updating both this guard and the comments around
-      // `aliveChannels` declaration.
-      if (aliveChannels.size > 2) {
-        writeStderrLine(
-          `qwen serve: WARNING aliveChannels.size=${aliveChannels.size} ` +
-            `(expected 1, max 2 during killSession-then-spawnOrAttach ` +
-            `overlap) — possible channel leak; check that prior channels' ` +
-            `channel.exited fired and the handler ran cleanup.`,
-        );
-      }
-
       // One-time channel.exited cleanup. The child dying takes ALL
       // multiplexed sessions with it — iterate `sessionIds` (snapshot
       // first to be safe against concurrent killSession during
       // iteration), publish `session_died` on each session's bus,
-      // remove from byId / defaultEntry / pending tables.
+      // remove from byId / default attach targets / pending tables.
       //
       // Registered BEFORE the `initialize` await so init-failure /
       // child-crash / late-shutdown all converge here. During
@@ -2032,9 +2014,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // leave the entry in `aliveChannels` until this handler fires,
       // so `killAllSync` still has a reference to fire SIGKILL during
       // the SIGTERM grace window — even if a concurrent `spawnOrAttach`
-      // has already reassigned `channelInfo` to a fresh channel.
+      // has already installed a fresh channel for the same execution cwd.
       void channel.exited.then((exitInfo) => {
-        if (channelInfo === info) cancelIdleTimer();
+        if (channelInfoByExecutionCwd.get(info.executionCwd) === info) {
+          cancelIdleTimer(info);
+        }
         if (info.workspaceMcpDiscoveryTimer) {
           clearTimeout(info.workspaceMcpDiscoveryTimer);
           info.workspaceMcpDiscoveryTimer = undefined;
@@ -2045,7 +2029,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         info.workspaceMcpAuthenticationTimers.clear();
         info.workspaceMcpAuthenticationServerNames.clear();
         aliveChannels.delete(info);
-        if (channelInfo === info) channelInfo = undefined;
+        if (channelInfoByExecutionCwd.get(info.executionCwd) === info) {
+          channelInfoByExecutionCwd.delete(info.executionCwd);
+        }
         const sessions = Array.from(info.sessionIds);
         info.sessionIds.clear();
         // Operator breadcrumb for UNEXPECTED channel exits. Without
@@ -2115,7 +2101,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           // dying child can't leak into the early-event buffer for a
           // future load/resume of the same persisted session id.
           info.client.markSessionClosed(sid);
-          if (defaultEntry === sessEntry) defaultEntry = undefined;
+          if (
+            defaultEntriesByExecutionCwd.get(sessEntry.executionCwd) ===
+            sessEntry
+          ) {
+            defaultEntriesByExecutionCwd.delete(sessEntry.executionCwd);
+          }
           sessEntry.events.close();
         }
       });
@@ -2147,7 +2138,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         );
       } catch (err) {
         // Mark the half-initialized channel as dying/unavailable, then
-        // kill it. Coalesced callers (`inFlightChannelSpawn` branch in
+        // kill it. Coalesced callers (`inFlightChannelSpawns` branch in
         // `ensureChannel`) observe the same rejection on this promise
         // and propagate it to their callers; the `inFlightSpawns`
         // tracker is cleared in `spawnOrAttach`'s finally so a follow-
@@ -2173,25 +2164,29 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       }
 
       // Handshake succeeded — now publish the channel as the
-      // attach-available slot. `channelInfo` is assigned LAST so
-      // `ensureChannel`'s fast-path (`if (channelInfo && !.isDying)`)
+      // attach-available slot. The map is updated LAST so
+      // `ensureChannel`'s fast path
       // never returns a still-handshaking channel to a concurrent
       // caller.
-      channelInfo = info;
+      channelInfoByExecutionCwd.set(executionCwd, info);
       info.handshakeComplete = true;
       telemetry.metrics?.channelLifecycle('spawn');
       return info;
     })();
 
-    inFlightChannelSpawn = promise;
+    inFlightChannelSpawns.set(executionCwd, promise);
     try {
       return await promise;
     } finally {
-      inFlightChannelSpawn = undefined;
+      if (inFlightChannelSpawns.get(executionCwd) === promise) {
+        inFlightChannelSpawns.delete(executionCwd);
+      }
     }
   }
 
   async function doSpawn(
+    workspaceCwd: string,
+    executionCwd: string,
     modelServiceId: string | undefined,
     effectiveScope: 'single' | 'thread',
     approvalMode: ApprovalMode | undefined,
@@ -2200,8 +2195,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     parentSessionId?: string,
     sourceType?: string,
     sourceId?: string,
+    startupNotice?: string,
   ): Promise<BridgeSession> {
-    // Get-or-create the daemon's single channel, then call
+    // Get or create the channel for this execution cwd, then call
     // `connection.newSession()` on it. Sessions share the child's
     // process / OAuth / file-cache / hierarchy-memory parse.
     //
@@ -2212,15 +2208,16 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     //
     // BkwQA: when the failed newSession was the channel's ONLY
     // attempt (sessionIds.size === 0), the empty channel must NOT
-    // linger — it would stay set as `channelInfo` invisible to
+    // linger — it would stay in the attach-target map while invisible to
     // `sessionCount` / `maxSessions` (both backed by `byId`), and
     // repeated failing creates would still find this channel via
     // `ensureChannel`, never spawning a fresh one. Tear down the
     // empty channel so the next attempt gets a clean spawn.
+    const currentChannel = channelInfoByExecutionCwd.get(executionCwd);
     const channelPath =
-      channelInfo && !channelInfo.isDying
+      currentChannel && !currentChannel.isDying
         ? 'reused'
-        : inFlightChannelSpawn
+        : inFlightChannelSpawns.has(executionCwd)
           ? 'joined'
           : 'spawned_on_request';
     const ci = await telemetry.withSpan(
@@ -2229,7 +2226,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         'qwen-code.daemon.bridge.operation': 'channel.wait',
         'qwen-code.daemon.channel.path': channelPath,
       },
-      ensureChannel,
+      async () => await ensureChannel(executionCwd),
     );
     ci.sessionSpawnsInFlight++;
     let sessionRegistered = false;
@@ -2256,7 +2253,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             const response = await withTimeout(
               ci.connection.newSession(
                 telemetry.injectPromptContext({
-                  cwd: boundWorkspace,
+                  cwd: executionCwd,
                   mcpServers: [],
                 }),
               ),
@@ -2279,9 +2276,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           // Mark dying SYNCHRONOUSLY so a concurrent `spawnOrAttach`
           // calling `ensureChannel()` between this point and the
           // `channel.exited` cleanup spawns a fresh channel instead of
-          // attaching to the one we're about to tear down. `channelInfo`
-          // stays set until OS reap so `killAllSync` mid-SIGTERM still
-          // finds a target (BkUyD invariant).
+          // attaching to the one we're about to tear down. `aliveChannels`
+          // retains it until OS reap so `killAllSync` still finds it.
           ci.isDying = true;
           await ci.channel.kill().catch(() => {
             /* best-effort — channel.exited handler still runs */
@@ -2302,9 +2298,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       const entry = createSessionEntry(
         ci,
         newSessionResp.sessionId,
-        boundWorkspace,
+        workspaceCwd,
+        executionCwd,
         undefined,
-        { parentSessionId, sourceType, sourceId },
+        { parentSessionId, sourceType, sourceId, startupNotice },
       );
       initializedSessionId = entry.sessionId;
       sessionRegistered = true;
@@ -2475,15 +2472,23 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         );
       }
 
-      // `defaultEntry` is the single-scope attach target — only sessions
+      // The per-execution-cwd default is the single-scope attach target; only sessions
       // SPAWNED UNDER `'single'` may claim it. Publish it only after
       // fatal initialization has succeeded, otherwise a concurrent attach
       // can join a session that the failing initializer is about to close.
-      if (effectiveScope === 'single' && !defaultEntry) defaultEntry = entry;
+      if (
+        effectiveScope === 'single' &&
+        !defaultEntriesByExecutionCwd.has(executionCwd)
+      ) {
+        defaultEntriesByExecutionCwd.set(executionCwd, entry);
+      }
 
       return {
         sessionId: entry.sessionId,
         workspaceCwd: entry.workspaceCwd,
+        ...(entry.executionCwd !== entry.workspaceCwd
+          ? { executionCwd: entry.executionCwd }
+          : {}),
         attached: false,
         clientId,
         createdAt: entry.createdAt,
@@ -2839,14 +2844,15 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
   };
 
   const liveChannelInfo = (): ChannelInfo | undefined => {
-    if (!channelInfo || channelInfo.isDying) return undefined;
-    return channelInfo;
+    const info = channelInfoByExecutionCwd.get(boundWorkspace);
+    return info && !info.isDying ? info : undefined;
   };
 
   const channelInfoForEntry = (
     entry: SessionEntry,
   ): ChannelInfo | undefined => {
-    if (channelInfo?.channel === entry.channel) return channelInfo;
+    const current = channelInfoByExecutionCwd.get(entry.executionCwd);
+    if (current?.channel === entry.channel) return current;
     for (const info of aliveChannels) {
       if (info.channel === entry.channel) return info;
     }
@@ -3432,6 +3438,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     ci: ChannelInfo,
     sessionId: string,
     workspaceCwd: string,
+    executionCwd: string,
     events = createSessionEventBus(),
     options: {
       drainEarlyEvents?: boolean;
@@ -3439,23 +3446,28 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       parentSessionId?: string;
       sourceType?: string;
       sourceId?: string;
+      startupNotice?: string;
     } = {},
   ): SessionEntry => {
     const entry: SessionEntry = {
       sessionId,
       workspaceCwd,
+      executionCwd,
       createdAt: new Date().toISOString(),
       ...(options.parentSessionId
         ? { parentSessionId: options.parentSessionId }
         : {}),
       ...(options.sourceType ? { sourceType: options.sourceType } : {}),
       ...(options.sourceId !== undefined ? { sourceId: options.sourceId } : {}),
+      ...(options.startupNotice
+        ? { startupNotice: options.startupNotice }
+        : {}),
       channel: ci.channel,
       connection: ci.connection,
       events,
       artifacts: new SessionArtifactStore({
         sessionId,
-        workspaceCwd,
+        workspaceCwd: executionCwd,
         persistence: createSessionArtifactPersistence(ci.connection, sessionId),
       }),
       recordingDegraded: false,
@@ -3771,6 +3783,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       throw new Error('AcpSessionBridge is shutting down');
     }
     const workspaceKey = resolveWorkspaceKey(req.workspaceCwd);
+    const executionCwd = req.executionCwd ?? workspaceKey;
+    if (!path.isAbsolute(executionCwd)) {
+      throw new Error(
+        `executionCwd must be an absolute path; got "${executionCwd}"`,
+      );
+    }
     if (
       req.approvalMode !== undefined &&
       !KNOWN_APPROVAL_MODES.has(req.approvalMode)
@@ -3792,6 +3810,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       return {
         sessionId: existing.sessionId,
         workspaceCwd: existing.workspaceCwd,
+        ...(existing.executionCwd !== existing.workspaceCwd
+          ? { executionCwd: existing.executionCwd }
+          : {}),
         attached: true,
         clientId,
         createdAt: existing.createdAt,
@@ -3898,7 +3919,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     };
     const promise = (async (): Promise<BridgeRestoredSession> => {
       pendingRestoreEvents.set(req.sessionId, restoreEvents);
-      ci = await ensureChannel();
+      ci = await ensureChannel(executionCwd);
       ci.pendingRestoreIds.add(req.sessionId);
       // Mark this id as in-flight restore BEFORE the ACP
       // `loadSession`/`unstable_resumeSession` call. Restore-time
@@ -3939,7 +3960,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             withTimeout(
               ci.connection.loadSession({
                 sessionId: req.sessionId,
-                cwd: workspaceKey,
+                cwd: executionCwd,
                 // Restore path drops per-request `mcpServers` (matches
                 // `doSpawn`); daemon-wide MCP comes from settings on
                 // the agent side. The SDK's `RestoreSessionRequest`
@@ -3970,7 +3991,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             withTimeout(
               ci.connection.unstable_resumeSession({
                 sessionId: req.sessionId,
-                cwd: workspaceKey,
+                cwd: executionCwd,
                 mcpServers: [],
               }),
               initTimeoutMs,
@@ -4039,6 +4060,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         return {
           sessionId: racedEntry.sessionId,
           workspaceCwd: racedEntry.workspaceCwd,
+          ...(racedEntry.executionCwd !== racedEntry.workspaceCwd
+            ? { executionCwd: racedEntry.executionCwd }
+            : {}),
           attached: true,
           clientId,
           createdAt: racedEntry.createdAt,
@@ -4058,6 +4082,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         ci,
         req.sessionId,
         workspaceKey,
+        executionCwd,
         restoreEvents,
         {
           drainEarlyEvents: replayUpdates.length === 0,
@@ -4130,11 +4155,14 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // subsequent omitted-id `POST /session` callers under `single`
       // scope. Those callers asked for "any default", and silently
       // joining a restored live history would surprise them.
-      // `defaultEntry` is reserved for sessions created through
+      // Default attach targets are reserved for sessions created through
       // `doSpawn` under `'single'` scope.
       return {
         sessionId: entry.sessionId,
         workspaceCwd: entry.workspaceCwd,
+        ...(entry.executionCwd !== entry.workspaceCwd
+          ? { executionCwd: entry.executionCwd }
+          : {}),
         attached: false,
         clientId,
         createdAt: entry.createdAt,
@@ -4224,16 +4252,17 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       'session.id': sessionId,
       'session.close.reason': reason,
     });
-    if (defaultEntry === entry) defaultEntry = undefined;
+    if (defaultEntriesByExecutionCwd.get(entry.executionCwd) === entry) {
+      defaultEntriesByExecutionCwd.delete(entry.executionCwd);
+    }
     // HAZARD: Resolve the channel via `channelInfoForEntry(entry)` (search
     // `aliveChannels` for the entry's actual channel) instead of the
-    // module-scoped `channelInfo` (the CURRENT attach target). The two
-    // diverge during the channel-overlap window — A dying, B freshly
-    // spawned as `channelInfo` — where capturing `channelInfo` would
+    // current attach-target map entry. The two diverge during the
+    // channel-overlap window — A dying, B freshly spawned — where capturing B would
     // (1) skip the `sessionIds.delete()` since `B.channel !==
     // entry.channel`, and (2) call `markSessionClosed` on B's client
     // instead of A's. The regression test is single-channel smoke only
-    // and WILL NOT fail if this reverts to module-scoped channelInfo.
+    // and WILL NOT fail if this reverts to the current map entry.
     // Keep `channelInfoForEntry(entry)` until a deterministic overlap
     // test lands.
     const ci = channelInfoForEntry(entry);
@@ -4344,6 +4373,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         sessions: [...byId.values()].map((entry) => ({
           sessionId: entry.sessionId,
           workspaceCwd: entry.workspaceCwd,
+          ...(entry.executionCwd !== entry.workspaceCwd
+            ? { executionCwd: entry.executionCwd }
+            : {}),
           createdAt: entry.createdAt,
           ...(entry.displayName ? { displayName: entry.displayName } : {}),
           clientCount: entry.clientIds.size,
@@ -4444,6 +4476,13 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // case-insensitive FS, a symlinked aliased path, …) — that
       // still needs the realpath to compare correctly.
       const workspaceKey = resolveWorkspaceKey(req.workspaceCwd);
+      const executionCwd = req.executionCwd ?? workspaceKey;
+      if (!path.isAbsolute(executionCwd)) {
+        throw new Error(
+          `executionCwd must be an absolute path; got "${executionCwd}"`,
+        );
+      }
+      const executionKey = path.resolve(executionCwd);
 
       // Resolve the effective scope for THIS call. A per-request
       // `req.sessionScope` overrides the daemon-wide default; omitting
@@ -4472,7 +4511,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       }
 
       if (effectiveScope === 'single') {
-        const existing = defaultEntry;
+        const existing = defaultEntriesByExecutionCwd.get(executionKey);
         if (existing) {
           // BRSCi: bump attach counter BEFORE any await so the
           // spawn-owner's disconnect reaper (server.ts:
@@ -4526,6 +4565,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           return {
             sessionId: existing.sessionId,
             workspaceCwd: existing.workspaceCwd,
+            ...(existing.executionCwd !== existing.workspaceCwd
+              ? { executionCwd: existing.executionCwd }
+              : {}),
             attached: true,
             clientId,
             createdAt: existing.createdAt,
@@ -4541,7 +4583,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // attach (the spawn was someone else's, not theirs). If the
         // reporter asked for a different modelServiceId than the spawn
         // chose, apply it now.
-        const inFlight = inFlightSpawns.get(workspaceKey);
+        const singleSpawnKey = `${workspaceKey}\0${executionKey}`;
+        const inFlight = inFlightSpawns.get(singleSpawnKey);
         if (inFlight) {
           const session = await inFlight;
           // BRSCi: bump attach counter SYNCHRONOUSLY in the same
@@ -4620,6 +4663,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         releaseFreshSessionReservation(admission);
       };
       const promise = doSpawn(
+        workspaceKey,
+        executionKey,
         req.modelServiceId,
         effectiveScope,
         req.approvalMode,
@@ -4628,6 +4673,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         req.parentSessionId,
         source.sourceType,
         source.sourceId,
+        req.startupNotice,
       );
       // Track in-flight spawns regardless of scope. Under `single`
       // this also serves the coalescing path above (a parallel
@@ -4643,8 +4689,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // workspace key.
       const tracker =
         effectiveScope === 'single'
-          ? workspaceKey
-          : `${workspaceKey}#${randomUUID()}`;
+          ? `${workspaceKey}\0${executionKey}`
+          : `${workspaceKey}\0${executionKey}#${randomUUID()}`;
       inFlightSpawns.set(tracker, promise);
       try {
         return await promise;
@@ -4902,8 +4948,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
                   }
                   throw echoErr;
                 }
+                const agentPromptRequest = prependSystemReminder(
+                  promptRequest,
+                  consumeStartupNotice(entry),
+                );
                 const promptPromise = entry.connection
-                  .prompt(promptRequest)
+                  .prompt(agentPromptRequest)
                   .finally(() => {
                     if (entry.promptActive) {
                       entry.promptActive = false;
@@ -6916,7 +6966,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         return { exitCode: null, output: '', aborted: true };
       }
 
-      const cwd = entry.workspaceCwd;
+      const cwd = entry.executionCwd;
 
       entry.events.publish({
         type: 'user_shell_command',
@@ -7451,7 +7501,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       }
       // Remove from the state eagerly so concurrent `spawnOrAttach`
       // can't reattach to a session we're tearing down.
-      if (defaultEntry === entry) defaultEntry = undefined;
+      if (defaultEntriesByExecutionCwd.get(entry.executionCwd) === entry) {
+        defaultEntriesByExecutionCwd.delete(entry.executionCwd);
+      }
       byId.delete(sessionId);
       telemetry.metrics?.sessionLifecycle('die');
       emitSessionLifecycle({
@@ -7466,12 +7518,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       //
       // HAZARD: Same channel-overlap fix as in `closeSession` above.
       // `channelInfoForEntry(entry)` returns the entry's actual
-      // channel rather than the module-scoped `channelInfo` (current
-      // attach target), preventing the "kill operates on the freshly-
+      // channel rather than the current attach-target map entry, preventing
+      // the "kill operates on the freshly-
       // spawned channel B instead of the dying channel A" cascade
       // during the overlap window. The regression test is single-channel
       // smoke only and WILL NOT fail if this reverts to module-scoped
-      // channelInfo. Keep `channelInfoForEntry(entry)` until a
+      // map entry. Keep `channelInfoForEntry(entry)` until a
       // deterministic overlap test lands.
       const ci = channelInfoForEntry(entry);
       if (!ci) {
@@ -7574,21 +7626,18 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     },
 
     killAllSync() {
-      // Synchronous best-effort SIGKILL on EVERY alive channel
-      // (typically 1, but during a `killSession`-then-`spawnOrAttach`
-      // overlap there can be 2). Set `shuttingDown` so any racing
-      // async path fails fast.
+      // Synchronous best-effort SIGKILL on every alive execution-cwd channel.
+      // Set `shuttingDown` so any racing async path fails fast.
       //
       // BkUyD: iterate `aliveChannels` (the OS-level "still alive"
-      // source of truth) — `channelInfo` only points at the CURRENT
-      // attach target, missing any dying channel whose
-      // `channel.exited` hasn't fired yet.
+      // source of truth); the attach-target map can omit replaced channels
+      // whose `channel.exited` hasn't fired yet.
       shuttingDown = true;
       cancelIdleTimer();
       stopSessionReaper();
       const channels = Array.from(aliveChannels);
       const entries = Array.from(byId.values());
-      defaultEntry = undefined;
+      defaultEntriesByExecutionCwd.clear();
       byId.clear();
       for (const entry of entries) {
         emitSessionLifecycle({
@@ -7625,9 +7674,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         cancelIdleTimer();
         stopSessionReaper();
         const entries = Array.from(byId.values());
-        // Snapshot every alive channel (typically 1; up to 2 during a
-        // `killSession`-then-`spawnOrAttach` overlap) — entries are
-        // intentionally NOT removed from `aliveChannels` here; their
+        // Snapshot every alive execution-cwd channel. Entries are intentionally
+        // NOT removed from `aliveChannels` here; their
         // `channel.exited` handlers clear them once the OS has reaped
         // each child. That preserves the BkUyD invariant: a
         // double-Ctrl+C arriving mid-SIGTERM-grace can still find every
@@ -7648,7 +7696,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           e.pendingPermissionIds.clear();
           e.pendingInteractions.clear();
         }
-        defaultEntry = undefined;
+        defaultEntriesByExecutionCwd.clear();
         byId.clear();
         // Publish a terminal `session_died` BEFORE closing each bus so SSE
         // subscribers can distinguish "daemon shut down" from a transient
@@ -7678,8 +7726,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // Wait for in-flight channel + session spawns. The snapshot
         // above only sees what's already registered; a doSpawn past
         // `newSession()` but pre-`byId.set` is missed, as is an
-        // `ensureChannel` past `channelFactory()` but pre-`channelInfo
-        // = info`. The late-shutdown re-checks at doSpawn/ensureChannel
+        // `ensureChannel` past `channelFactory()` but before the map update.
+        // The late-shutdown re-checks at doSpawn/ensureChannel
         // catch both — but without these awaits, `bridge.shutdown()`
         // would resolve before they finish, and the orphan stderr
         // error from a half-built child would fire AFTER the daemon
@@ -7698,17 +7746,20 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
               () => undefined,
             ),
         );
-        const inFlightChannelAwait: Promise<void> = inFlightChannelSpawn
-          ? inFlightChannelSpawn.then(
+        const inFlightChannelAwaits = Array.from(
+          inFlightChannelSpawns.values(),
+        ).map(
+          (spawn): Promise<void> =>
+            spawn.then(
               () => undefined,
               () => undefined,
-            )
-          : Promise.resolve();
+            ),
+        );
         await Promise.all([
           ...channels.map((ci) => ci.channel.kill().catch(() => {})),
           ...inFlightSessionAwaits,
           ...inFlightRestoreAwaits,
-          inFlightChannelAwait,
+          ...inFlightChannelAwaits,
         ]);
       })().then(resolveShutdown, rejectShutdown);
       return shutdownPromise;

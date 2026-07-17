@@ -195,6 +195,21 @@ describe('createDaemonSessionActions', () => {
     });
   });
 
+  it('forwards options.startIn to the detached create branch', async () => {
+    const nextSession = createMockSession('session-b');
+    const createDetachedSession = vi.fn(async () => nextSession);
+    const { actions } = createActionsHarness({
+      connection: { status: 'connected' },
+      createDetachedSession,
+    });
+
+    await actions.createSession({ startIn: 'worktree' });
+
+    expect(createDetachedSession).toHaveBeenCalledWith(undefined, {
+      startIn: 'worktree',
+    });
+  });
+
   it('forwards options.sourceType to the detached create branch', async () => {
     const nextSession = createMockSession('session-b');
     const createDetachedSession = vi.fn(async () => nextSession);
@@ -239,6 +254,22 @@ describe('createDaemonSessionActions', () => {
 
     expect(existingSession.client.createOrAttachSession).toHaveBeenCalledWith(
       expect.objectContaining({ approvalMode: 'yolo' }),
+    );
+  });
+
+  it('folds options.startIn into the active session request', async () => {
+    const existingSession = createMockSession('session-a');
+    const nextSession = createMockSession('session-b');
+    existingSession.client.createOrAttachSession.mockResolvedValue(nextSession);
+    const { actions } = createActionsHarness({
+      connection: { status: 'connected', sessionId: 'session-a' },
+      session: existingSession,
+    });
+
+    await actions.createSession({ startIn: 'worktree' });
+
+    expect(existingSession.client.createOrAttachSession).toHaveBeenCalledWith(
+      expect.objectContaining({ startIn: 'worktree' }),
     );
   });
 

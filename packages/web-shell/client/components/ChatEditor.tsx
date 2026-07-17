@@ -11,7 +11,10 @@ import {
 } from 'react';
 import type { CSSProperties, ReactNode, RefObject } from 'react';
 import { Tooltip as TooltipPrimitive } from 'radix-ui';
-import { DAEMON_APPROVAL_MODES } from '@qwen-code/webui/daemon-react-sdk';
+import {
+  DAEMON_APPROVAL_MODES,
+  type DaemonStartInMode,
+} from '@qwen-code/webui/daemon-react-sdk';
 import type { CommandInfo } from '../adapters/types';
 import type { UseDaemonFollowupSuggestionReturn } from '@qwen-code/webui/daemon-react-sdk';
 import type { DaemonSessionGroupPresetColor } from '@qwen-code/sdk/daemon';
@@ -166,6 +169,10 @@ interface ChatEditorProps {
   builtinAtProviders?: WebShellBuiltinAtProvidersConfig;
   atProviders?: readonly WebShellAtProvider[];
   composerTagIcons?: WebShellComposerTagIconMap;
+  startInMode?: DaemonStartInMode;
+  startInWorktreeAvailable?: boolean;
+  startInWorktreeUnavailableReason?: string;
+  onStartInModeChange?: (mode: DaemonStartInMode) => void;
 }
 
 const CHAT_EDITOR_THEME = {
@@ -514,6 +521,8 @@ function ModelIcon() {
 interface DropdownItem extends ToolbarDropdownItem {
   description?: string;
   icon?: ReactNode;
+  disabled?: boolean;
+  title?: string;
 }
 
 interface QuickActionItem {
@@ -766,7 +775,10 @@ function ToolbarPopover({
               className={`${styles.dropdownItem} ${
                 item.id === activeId ? styles.dropdownItemActive : ''
               }`}
+              disabled={item.disabled}
+              title={item.title}
               onClick={() => {
+                if (item.disabled) return;
                 selectionRef.current = true;
                 onSelect(item.id);
               }}
@@ -1165,6 +1177,10 @@ export const ChatEditor = memo(
       builtinAtProviders,
       atProviders,
       composerTagIcons,
+      startInMode = 'local',
+      startInWorktreeAvailable = false,
+      startInWorktreeUnavailableReason,
+      onStartInModeChange,
     } = props;
 
     const {
@@ -1213,6 +1229,7 @@ export const ChatEditor = memo(
 
     const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
     const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
+    const [startInDropdownOpen, setStartInDropdownOpen] = useState(false);
     const [quickActionsOpen, setQuickActionsOpen] = useState(false);
     const [workspaceTooltipOpen, setWorkspaceTooltipOpen] = useState(false);
     const [showQuickActions, setShowQuickActions] = useState(isTouchLikeDevice);
@@ -1465,6 +1482,23 @@ export const ChatEditor = memo(
         })),
       [availableModels],
     );
+    const startInItems = useMemo<DropdownItem[]>(
+      () => [
+        { id: 'local', label: 'Work locally' },
+        {
+          id: 'worktree',
+          label: 'New worktree',
+          disabled: !startInWorktreeAvailable,
+          title: startInWorktreeAvailable
+            ? undefined
+            : startInWorktreeUnavailableReason,
+          description: startInWorktreeAvailable
+            ? undefined
+            : startInWorktreeUnavailableReason,
+        },
+      ],
+      [startInWorktreeAvailable, startInWorktreeUnavailableReason],
+    );
 
     const handleModeSelect = useCallback(
       (modeId: string) => {
@@ -1482,6 +1516,15 @@ export const ChatEditor = memo(
         core.focus();
       },
       [onSelectModel, core],
+    );
+    const handleStartInSelect = useCallback(
+      (modeId: string) => {
+        if (modeId !== 'local' && modeId !== 'worktree') return;
+        onStartInModeChange?.(modeId);
+        setStartInDropdownOpen(false);
+        core.focus();
+      },
+      [onStartInModeChange, core],
     );
     const dispatchComposerKey = useCallback(
       (event: QuickKeyItem['event']) => {
@@ -1503,6 +1546,7 @@ export const ChatEditor = memo(
         setQuickActionsOpen(false);
         setModeDropdownOpen(false);
         setModelDropdownOpen(false);
+        setStartInDropdownOpen(false);
         core.closeSlashMenu();
         core.closeAtMenu();
         if (action.action.type === 'insert') {
@@ -1583,6 +1627,8 @@ export const ChatEditor = memo(
 
     // Mode display label
     const modeLabel = getModeLabel(currentMode, t);
+    const startInLabel =
+      startInMode === 'worktree' ? 'New worktree' : 'Work locally';
 
     const currentModelLabel = currentModel
       ? (availableModels.find((model) => model.id === currentModel)?.label ??
@@ -1796,7 +1842,7 @@ export const ChatEditor = memo(
     return (
       <div
         className={`${styles.editorShell} ${
-          modeDropdownOpen || modelDropdownOpen
+          modeDropdownOpen || modelDropdownOpen || startInDropdownOpen
             ? styles.editorShellDropdownOpen
             : ''
         }`}
@@ -1811,6 +1857,7 @@ export const ChatEditor = memo(
           onClick={() => {
             setModeDropdownOpen(false);
             setModelDropdownOpen(false);
+            setStartInDropdownOpen(false);
             setQuickActionsOpen(false);
             core.focus();
           }}
@@ -2125,7 +2172,10 @@ export const ChatEditor = memo(
                         activeId={currentMode}
                         onOpenChange={(open) => {
                           setModeDropdownOpen(open);
-                          if (open) setModelDropdownOpen(false);
+                          if (open) {
+                            setModelDropdownOpen(false);
+                            setStartInDropdownOpen(false);
+                          }
                         }}
                         onSelect={handleModeSelect}
                         tooltip={modeLabel}
@@ -2172,7 +2222,10 @@ export const ChatEditor = memo(
                         activeId={currentModel}
                         onOpenChange={(open) => {
                           setModelDropdownOpen(open);
-                          if (open) setModeDropdownOpen(false);
+                          if (open) {
+                            setModeDropdownOpen(false);
+                            setStartInDropdownOpen(false);
+                          }
                         }}
                         onSelect={handleModelSelect}
                         tooltip={modelLabel}
@@ -2213,6 +2266,46 @@ export const ChatEditor = memo(
                       />
                     </div>
                   )}
+                  {onStartInModeChange && (
+                    <div className={styles.dropdownWrapper}>
+                      <ToolbarPopover
+                        open={startInDropdownOpen}
+                        items={startInItems}
+                        activeId={startInMode}
+                        onOpenChange={(open) => {
+                          setStartInDropdownOpen(open);
+                          if (open) {
+                            setModeDropdownOpen(false);
+                            setModelDropdownOpen(false);
+                          }
+                        }}
+                        onSelect={handleStartInSelect}
+                        tooltip="Start in"
+                        showCheck
+                        trigger={
+                          <button
+                            className={styles.toolBtn}
+                            data-web-shell-start-in-button
+                            data-web-shell-toolbar-popover-trigger
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              core.closeSlashMenu();
+                              core.closeAtMenu();
+                              setQuickActionsOpen(false);
+                            }}
+                            aria-label="Start in"
+                          >
+                            <span className={styles.toolBtnText}>
+                              {startInLabel}
+                            </span>
+                            <span className={styles.toolBtnArrow}>
+                              <ChevronDownIcon />
+                            </span>
+                          </button>
+                        }
+                      />
+                    </div>
+                  )}
                   {ToolbarEnd && (
                     <div ref={toolbarEndRef} className={styles.toolbarEnd}>
                       <ToolbarEnd
@@ -2236,6 +2329,7 @@ export const ChatEditor = memo(
                       core.closeAtMenu();
                       setModeDropdownOpen(false);
                       setModelDropdownOpen(false);
+                      setStartInDropdownOpen(false);
                       setQuickActionsOpen((value) => !value);
                     }}
                     aria-expanded={quickActionsOpen}

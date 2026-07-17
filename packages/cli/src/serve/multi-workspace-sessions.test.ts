@@ -7,6 +7,8 @@
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import * as os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import {
@@ -14,8 +16,11 @@ import {
   SessionService,
   Storage,
   createDebugLogger,
+  readWorktreeSessionMarker,
   resetDebugLoggingState,
+  restoreWorktreeContext,
   setDebugLogSession,
+  writeWorktreeSession,
 } from '@qwen-code/qwen-code-core';
 import {
   InvalidRewindTargetError,
@@ -49,6 +54,7 @@ const SECONDARY_CWD = path.resolve(path.sep, 'work', 'secondary');
 const UNKNOWN_CWD = path.resolve(path.sep, 'work', 'unknown');
 const TEST_TOKEN = 'test-token';
 const TEST_AUTHORIZATION = `Bearer ${TEST_TOKEN}`;
+const execFileAsync = promisify(execFile);
 
 const baseOpts: ServeOptions = {
   hostname: '127.0.0.1',
@@ -64,6 +70,7 @@ interface FakeBridge extends AcpSessionBridge {
   }>;
   readonly cancelCalls: string[];
   readonly closeCalls: string[];
+  readonly killCalls: string[];
   readonly heartbeatCalls: string[];
   readonly detachCalls: string[];
   readonly eventsCalls: Array<{ sessionId: string; options?: unknown }>;
@@ -230,6 +237,24 @@ async function archiveStoredSession(
   );
 }
 
+async function initGitRepo(): Promise<string> {
+  const repo = await fsp.realpath(
+    await fsp.mkdtemp(path.join(os.tmpdir(), 'qwen-route-repo-')),
+  );
+  await execFileAsync('git', ['init'], { cwd: repo });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], {
+    cwd: repo,
+  });
+  await execFileAsync('git', ['config', 'user.name', 'Test User'], {
+    cwd: repo,
+  });
+  await fsp.writeFile(path.join(repo, 'README.md'), '# test\n', 'utf8');
+  await execFileAsync('git', ['add', 'README.md'], { cwd: repo });
+  await execFileAsync('git', ['commit', '-m', 'initial'], { cwd: repo });
+  await execFileAsync('git', ['branch', '-M', 'main'], { cwd: repo });
+  return repo;
+}
+
 async function withRuntimeDir<T>(fn: () => Promise<T>): Promise<T> {
   const previousRuntimeDir = process.env['QWEN_RUNTIME_DIR'];
   const runtimeDir = await fsp.mkdtemp(
@@ -253,6 +278,8 @@ function makeBridge(
   summaries: BridgeSessionSummary[] = [],
   options: {
     channelLive?: boolean;
+    spawnImpl?: AcpSessionBridge['spawnOrAttach'];
+    spawnSessionId?: (index: number) => string;
     rewindImpl?: AcpSessionBridge['rewindSession'];
     shellImpl?: AcpSessionBridge['executeShellCommand'];
   } = {},
@@ -264,6 +291,7 @@ function makeBridge(
   const promptCalls: FakeBridge['promptCalls'] = [];
   const cancelCalls: string[] = [];
   const closeCalls: string[] = [];
+  const killCalls: string[] = [];
   const heartbeatCalls: string[] = [];
   const detachCalls: string[] = [];
   const eventsCalls: FakeBridge['eventsCalls'] = [];
@@ -295,6 +323,7 @@ function makeBridge(
     promptCalls,
     cancelCalls,
     closeCalls,
+    killCalls,
     heartbeatCalls,
     detachCalls,
     eventsCalls,
@@ -363,7 +392,10 @@ function makeBridge(
     },
     async spawnOrAttach(req: BridgeSpawnRequest) {
       spawnCalls.push(req);
-      const sessionId = `${workspaceCwd}-spawned-${spawnCalls.length}`;
+      if (options.spawnImpl) return options.spawnImpl(req);
+      const sessionId = options.spawnSessionId
+        ? options.spawnSessionId(spawnCalls.length)
+        : `${workspaceCwd}-spawned-${spawnCalls.length}`;
       const summary = makeSummary(sessionId, req.workspaceCwd);
       live.set(sessionId, summary);
       return {
@@ -639,6 +671,10 @@ function makeBridge(
       closeCalls.push(sessionId);
       live.delete(sessionId);
     },
+    async killSession(sessionId: string) {
+      killCalls.push(sessionId);
+      return live.delete(sessionId);
+    },
     getPendingPrompts(sessionId: string) {
       if (!live.has(sessionId)) throw new SessionNotFoundError(sessionId);
       pendingPromptCalls.push(sessionId);
@@ -719,8 +755,11 @@ function makeDaemonLog(): DaemonLogger {
 
 function makeHarness(opts?: {
   primaryTrusted?: boolean;
+  secondaryCwd?: string;
   secondaryTrusted?: boolean;
   secondaryChannelLive?: boolean;
+  secondarySpawnImpl?: AcpSessionBridge['spawnOrAttach'];
+  secondarySpawnSessionId?: (index: number) => string;
   daemonLog?: DaemonLogger;
   primarySummaries?: BridgeSessionSummary[];
   secondarySummaries?: BridgeSessionSummary[];
@@ -729,18 +768,25 @@ function makeHarness(opts?: {
   secondaryShellImpl?: AcpSessionBridge['executeShellCommand'];
   serveOptions?: Partial<ServeOptions>;
 }) {
+  const secondaryCwd = opts?.secondaryCwd ?? SECONDARY_CWD;
   const primaryBridge = makeBridge(
     PRIMARY_CWD,
     opts?.primarySummaries ?? [makeSummary('primary-session', PRIMARY_CWD)],
     { channelLive: true },
   );
   const secondaryBridge = makeBridge(
-    SECONDARY_CWD,
+    secondaryCwd,
     opts?.secondarySummaries ?? [
-      makeSummary('secondary-session', SECONDARY_CWD),
+      makeSummary('secondary-session', secondaryCwd),
     ],
     {
       channelLive: opts?.secondaryChannelLive ?? true,
+      ...(opts?.secondarySpawnImpl
+        ? { spawnImpl: opts.secondarySpawnImpl }
+        : {}),
+      ...(opts?.secondarySpawnSessionId
+        ? { spawnSessionId: opts.secondarySpawnSessionId }
+        : {}),
       ...(opts?.secondaryRewindImpl
         ? { rewindImpl: opts.secondaryRewindImpl }
         : {}),
@@ -759,7 +805,7 @@ function makeHarness(opts?: {
     }),
     makeRuntime({
       workspaceId: 'secondary-id',
-      workspaceCwd: SECONDARY_CWD,
+      workspaceCwd: secondaryCwd,
       primary: false,
       trusted: opts?.secondaryTrusted ?? true,
       bridge: secondaryBridge,
@@ -903,6 +949,174 @@ describe('multi-workspace session dispatch', () => {
       approvalMode: 'yolo',
     });
   });
+
+  it('accepts startIn:local without changing the bridge execution cwd', async () => {
+    const { app, secondaryBridge } = makeHarness();
+    const res = await request(app)
+      .post('/session')
+      .set('Host', host())
+      .send({ cwd: SECONDARY_CWD, startIn: 'local' });
+
+    expect(res.status).toBe(200);
+    expect(secondaryBridge.spawnCalls).toHaveLength(1);
+    expect(secondaryBridge.spawnCalls[0]).toMatchObject({
+      workspaceCwd: SECONDARY_CWD,
+    });
+    expect(secondaryBridge.spawnCalls[0]).not.toHaveProperty('executionCwd');
+  });
+
+  it('rejects invalid startIn before touching a bridge', async () => {
+    const { app, primaryBridge, secondaryBridge } = makeHarness();
+    const res = await request(app)
+      .post('/session')
+      .set('Host', host())
+      .send({ cwd: SECONDARY_CWD, startIn: 'bogus' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('invalid_start_in');
+    expect(primaryBridge.spawnCalls).toEqual([]);
+    expect(secondaryBridge.spawnCalls).toEqual([]);
+  });
+
+  it(
+    'rejects worktree creation outside a git repository before bridge spawn',
+    async () =>
+      await withRuntimeDir(async () => {
+        const workspace = await fsp.realpath(
+          await fsp.mkdtemp(path.join(os.tmpdir(), 'qwen-non-git-')),
+        );
+        const { app, secondaryBridge } = makeHarness({
+          secondaryCwd: workspace,
+        });
+
+        await request(app)
+          .post('/session')
+          .set('Host', host())
+          .send({ cwd: workspace, startIn: 'worktree' })
+          .expect(500);
+
+        expect(secondaryBridge.spawnCalls).toEqual([]);
+      }),
+    15_000,
+  );
+
+  it(
+    'rejects nested Qwen worktree creation before bridge spawn',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const nested = path.join(repo, '.qwen', 'worktrees', 'nested');
+        await fsp.mkdir(nested, { recursive: true });
+        const { app, secondaryBridge } = makeHarness({ secondaryCwd: nested });
+
+        await request(app)
+          .post('/session')
+          .set('Host', host())
+          .send({ cwd: nested, startIn: 'worktree' })
+          .expect(500);
+
+        expect(secondaryBridge.spawnCalls).toEqual([]);
+      }),
+    15_000,
+  );
+
+  it(
+    'creates a worktree session and persists restore metadata under the base workspace',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const { app, secondaryBridge } = makeHarness({
+          secondaryCwd: repo,
+          secondarySpawnSessionId: (index) => `spawned-${index}`,
+        });
+
+        const res = await request(app)
+          .post('/session')
+          .set('Host', host())
+          .send({ cwd: repo, startIn: 'worktree' });
+
+        expect(res.status).toBe(200);
+        expect(secondaryBridge.spawnCalls).toHaveLength(1);
+        const spawn = secondaryBridge.spawnCalls[0];
+        expect(spawn.workspaceCwd).toBe(repo);
+        expect(spawn.executionCwd).toEqual(
+          expect.stringContaining(path.join(repo, '.qwen', 'worktrees')),
+        );
+        expect(spawn.startupNotice).toContain(spawn.executionCwd!);
+
+        expect(await readWorktreeSessionMarker(spawn.executionCwd!)).toBe(
+          res.body.sessionId,
+        );
+        const restored = await restoreWorktreeContext(
+          new SessionService(repo).getWorktreeSessionPath(res.body.sessionId),
+        );
+        expect(restored.session).toMatchObject({
+          worktreePath: spawn.executionCwd,
+          originalCwd: repo,
+        });
+      }),
+    15_000,
+  );
+
+  it(
+    'removes the newly created worktree when bridge spawn fails',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const { app } = makeHarness({
+          secondaryCwd: repo,
+          secondarySpawnSessionId: (index) => `spawned-${index}`,
+          secondarySpawnImpl: async () => {
+            throw new Error('spawn failed');
+          },
+        });
+
+        await request(app)
+          .post('/session')
+          .set('Host', host())
+          .send({ cwd: repo, startIn: 'worktree' })
+          .expect(500);
+
+        const { stdout } = await execFileAsync(
+          'git',
+          ['worktree', 'list', '--porcelain'],
+          { cwd: repo },
+        );
+        expect(stdout).not.toContain(path.join('.qwen', 'worktrees'));
+      }),
+    15_000,
+  );
+
+  it(
+    'kills the fresh session and removes its worktree when sidecar persistence fails',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const sessionService = new SessionService(repo);
+        await fsp.mkdir(sessionService.getWorktreeSessionPath('spawned-1'), {
+          recursive: true,
+        });
+        const { app, secondaryBridge } = makeHarness({
+          secondaryCwd: repo,
+          secondarySpawnSessionId: (index) => `spawned-${index}`,
+        });
+
+        await request(app)
+          .post('/session')
+          .set('Host', host())
+          .send({ cwd: repo, startIn: 'worktree' })
+          .expect(500);
+
+        expect(secondaryBridge.killCalls).toEqual(['spawned-1']);
+        const { stdout } = await execFileAsync(
+          'git',
+          ['worktree', 'list', '--porcelain'],
+          { cwd: repo },
+        );
+        expect(stdout).not.toContain(path.join('.qwen', 'worktrees'));
+      }),
+    15_000,
+  );
 
   it('rejects unknown and untrusted workspace session creation before touching a bridge', async () => {
     const unknown = makeHarness();
@@ -1526,6 +1740,62 @@ describe('multi-workspace session dispatch', () => {
       },
     ]);
   });
+
+  it(
+    'restores a persisted worktree session with its execution cwd',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const sessionId = 'persisted-worktree-session';
+        const worktreePath = path.join(repo, '.qwen', 'worktrees', 'restored');
+        await fsp.mkdir(worktreePath, { recursive: true });
+        await writeStoredSession({
+          sessionId,
+          cwd: repo,
+          timestamp: '2026-07-08T00:00:00.000Z',
+          prompt: 'continue',
+          mtime: new Date('2026-07-08T00:01:00.000Z'),
+        });
+        const { stdout: head } = await execFileAsync(
+          'git',
+          ['rev-parse', 'HEAD'],
+          { cwd: repo },
+        );
+        await writeWorktreeSession(
+          new SessionService(repo).getWorktreeSessionPath(sessionId),
+          {
+            slug: 'restored',
+            worktreePath,
+            worktreeBranch: 'worktree-restored',
+            originalCwd: repo,
+            originalBranch: 'main',
+            originalHeadCommit: head.trim(),
+          },
+        );
+        const { app, secondaryBridge } = makeHarness({
+          secondaryCwd: repo,
+          secondarySummaries: [],
+        });
+
+        await request(app)
+          .post(`/session/${sessionId}/load`)
+          .set('Host', host())
+          .send({ cwd: repo })
+          .expect(200);
+
+        expect(secondaryBridge.restoreCalls).toEqual([
+          {
+            action: 'load',
+            req: expect.objectContaining({
+              sessionId,
+              workspaceCwd: repo,
+              executionCwd: worktreePath,
+            }),
+          },
+        ]);
+      }),
+    15_000,
+  );
 
   it('rejects unknown and untrusted restore cwd before touching a bridge', async () => {
     const unknown = makeHarness();

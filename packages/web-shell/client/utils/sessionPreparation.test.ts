@@ -95,6 +95,22 @@ describe('createAndAttachSessionForPrompt', () => {
     expect(actions.setModel).not.toHaveBeenCalled();
   });
 
+  it('forwards startIn to fresh prompt session creation', async () => {
+    const actions = createActions();
+
+    await prepareSession({
+      sessionActions: actions,
+      workspaceCwd: '/ws/secondary',
+      startIn: 'worktree',
+    });
+
+    expect(actions.createSession).toHaveBeenCalledWith({
+      workspaceCwd: '/ws/secondary',
+      startIn: 'worktree',
+      sourceType: 'default',
+    });
+  });
+
   it('attaches without a callback while connection state catches up', async () => {
     const actions = createActions();
 

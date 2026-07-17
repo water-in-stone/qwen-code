@@ -13,6 +13,7 @@ export {
   isNonBlockingAccepted,
   matchTurnEvent,
   type CreateSessionRequest,
+  type DaemonStartInMode,
   type DaemonClientOptions,
   type DaemonTurnError,
   type NonBlockingPromptAccepted,

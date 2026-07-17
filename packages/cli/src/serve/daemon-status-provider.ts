@@ -18,7 +18,7 @@
  */
 
 import { promises as fs } from 'node:fs';
-import { canUseRipgrep } from '@qwen-code/qwen-code-core';
+import { canUseRipgrep, GitWorktreeService } from '@qwen-code/qwen-code-core';
 import {
   type DaemonStatusProvider,
   mapDomainErrorToErrorKind,
@@ -220,6 +220,53 @@ async function buildDaemonPreflightCells(
             ? { status: 'ok' as const, detail: { version: v } }
             : { status: 'warning' as const, hint: 'git not found on PATH.' };
         }),
+    },
+    {
+      kind: 'worktree',
+      run: async () => {
+        if (/[\\/]\.qwen[\\/]worktrees[\\/]/.test(boundWorkspace)) {
+          return {
+            kind: 'worktree',
+            status: 'disabled',
+            locality: 'daemon',
+            hint: 'Already running inside a Qwen-managed worktree.',
+          };
+        }
+        try {
+          const service = new GitWorktreeService(boundWorkspace);
+          const git = await service.checkGitAvailable();
+          if (!git.available) {
+            return {
+              kind: 'worktree',
+              status: 'warning',
+              locality: 'daemon',
+              hint: git.error ?? 'git not found on PATH.',
+            };
+          }
+          const repoRoot = await service.getRepoTopLevel();
+          if (repoRoot === null) {
+            return {
+              kind: 'worktree',
+              status: 'disabled',
+              locality: 'daemon',
+              hint: 'Workspace is not inside a git repository.',
+            };
+          }
+          return {
+            kind: 'worktree',
+            status: 'ok',
+            locality: 'daemon',
+            detail: { repoRoot },
+          };
+        } catch (err) {
+          return {
+            kind: 'worktree',
+            status: 'error',
+            locality: 'daemon',
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
     },
     {
       kind: 'npm',

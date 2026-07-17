@@ -212,6 +212,7 @@ export type {
   DaemonPromptImage,
   /** Permission approval level: `'plan' | 'default' | 'auto-edit' | 'auto' | 'yolo'`. */
   DaemonApprovalMode,
+  DaemonStartInMode,
   DaemonAuthProviderBaseUrlOption,
   DaemonAuthProviderCatalog,
   DaemonAuthProviderDescriptor,
