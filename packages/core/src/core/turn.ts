@@ -16,6 +16,7 @@ import {
 } from '@google/genai';
 import type {
   ToolCallConfirmationDetails,
+  DeferredToolPresentation,
   ToolArtifact,
   ToolResult,
   ToolResultDisplay,
@@ -37,6 +38,7 @@ import {
 import type { LoopType } from '../telemetry/types.js';
 import type { ActiveGoal } from '../goals/activeGoalStore.js';
 import { getProviderToolCallId } from './toolCallIdUtils.js';
+import { providerToolName } from './deferred-tool-call-normalization.js';
 
 const ERROR_REPORT_HISTORY_TAIL_COUNT = 8;
 const ERROR_REPORT_TEXT_PREVIEW_CHARS = 200;
@@ -125,6 +127,12 @@ export interface ToolCallRequestInfo {
   providerCallId?: string;
   name: string;
   args: Record<string, unknown>;
+  /**
+   * Provider-visible wrapper name for normalized proxy calls. Internal
+   * scheduling, permission checks, validation, execution and telemetry use
+   * `name`/`args`; model-facing function responses use this field when set.
+   */
+  providerName?: string;
   isClientInitiated: boolean;
   prompt_id: string;
   response_id?: string;
@@ -141,6 +149,12 @@ export interface ToolCallResponseInfo {
   contentLength?: number;
   modelOverride?: string;
   artifacts?: ToolArtifact[];
+  /**
+   * Deferred tool schemas that were shown to the model by this response and
+   * can be committed after the response is accepted into the conversation.
+   * Used by ToolSearch + deferred_tool_call routing; not sent to the provider.
+   */
+  deferredToolPresentations?: DeferredToolPresentation[];
 }
 
 function normalizeRequestParts(req: PartListUnion): Part[] {
@@ -215,7 +229,7 @@ export function createDuplicateProviderToolCallResponse(
       {
         functionResponse: {
           id: request.callId,
-          name: request.name,
+          name: providerToolName(request),
           response: { error: message },
         },
       },

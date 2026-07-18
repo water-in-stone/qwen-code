@@ -590,10 +590,11 @@ export const useGeminiStream = (
           addItem(toolGroupDisplay, Date.now());
 
           // Handle tool response submission immediately when tools complete
-          await handleCompletedTools(
+          return handleCompletedTools(
             completedToolCallsFromScheduler as TrackedToolCall[],
           );
         }
+        return false;
       },
       config,
       getPreferredEditor,
@@ -2590,6 +2591,8 @@ export const useGeminiStream = (
       prompt_id?: string,
       metadata?: {
         notificationDisplayText?: string;
+        /** Fires after the next model request accepts the prepared context. */
+        onContextAccepted?: () => void;
         onDelivered?: () => void;
         onDeliveryFailed?: () => void;
         steerInput?: SteerInput;
@@ -2811,6 +2814,15 @@ export const useGeminiStream = (
           streamingResponseLengthRef.current = 0;
         }
 
+        // Stream rejection may be observed both while iterating and during
+        // post-processing. Report it once and suppress a later onDelivered.
+        let deliveryFailed = false;
+        const reportDeliveryFailure = () => {
+          if (deliveryFailed) return;
+          deliveryFailed = true;
+          metadata?.onDeliveryFailed?.();
+        };
+
         try {
           // Emit user message to dual output sidecar (if enabled).
           // Skip for tool-result submissions — those are emitted separately
@@ -2842,9 +2854,33 @@ export const useGeminiStream = (
                 : {}),
             },
           );
+          const acknowledgedStream = (async function* () {
+            let accepted = false;
+            let sawEvent = false;
+            for await (const event of stream) {
+              sawEvent = true;
+              const rejected =
+                event.type === ServerGeminiEventType.Error ||
+                event.type === ServerGeminiEventType.UserCancelled;
+              // Error and cancellation events are not evidence that the model
+              // accepted the request context.
+              if (rejected) {
+                reportDeliveryFailure();
+              } else if (!accepted) {
+                accepted = true;
+                metadata?.onContextAccepted?.();
+              }
+              yield event;
+            }
+            // A cleanly closed empty iterable still provides no evidence that
+            // the model received schema-bearing context, so fail closed.
+            if (!accepted && !sawEvent) {
+              reportDeliveryFailure();
+            }
+          })();
 
           const processingStatus = await processGeminiStreamEvents(
-            stream,
+            acknowledgedStream,
             userMessageTimestamp,
             abortSignal,
           );
@@ -2852,7 +2888,7 @@ export const useGeminiStream = (
           if (processingStatus === StreamProcessingStatus.UserCancelled) {
             submitPromptOnCompleteRef.current = null;
             isSubmittingQueryRef.current = false;
-            metadata?.onDeliveryFailed?.();
+            reportDeliveryFailure();
             return;
           }
 
@@ -2885,8 +2921,8 @@ export const useGeminiStream = (
           }
 
           if (lastPromptErroredRef.current) {
-            metadata?.onDeliveryFailed?.();
-          } else {
+            reportDeliveryFailure();
+          } else if (!deliveryFailed) {
             metadata?.onDelivered?.();
           }
 
@@ -2921,7 +2957,7 @@ export const useGeminiStream = (
             }
           }
         } catch (error: unknown) {
-          metadata?.onDeliveryFailed?.();
+          reportDeliveryFailure();
           if (error instanceof UnauthorizedError) {
             onAuthError('Session expired or is unauthorized.');
           } else if (!isNodeError(error) || error.name !== 'AbortError') {
@@ -3172,7 +3208,7 @@ export const useGeminiStream = (
       }
 
       if (activeModelStreamsRef.current > 0) {
-        return;
+        return false;
       }
 
       // Finalize any client-initiated tools as soon as they are done.
@@ -3256,7 +3292,7 @@ export const useGeminiStream = (
         geminiTools.length === 0 &&
         pendingDuplicateResponseParts.length === 0
       ) {
-        return;
+        return false;
       }
 
       if (
@@ -3266,7 +3302,7 @@ export const useGeminiStream = (
         markToolsAsSubmitted(
           geminiTools.map((toolCall) => toolCall.request.callId),
         );
-        return;
+        return false;
       }
 
       // If all the tools were cancelled, don't submit a response to Gemini.
@@ -3294,7 +3330,7 @@ export const useGeminiStream = (
           (toolCall) => toolCall.request.callId,
         );
         markToolsAsSubmitted(callIdsToMarkAsSubmitted);
-        return;
+        return false;
       }
 
       const responsesToSend: Part[] = geminiTools.flatMap(
@@ -3443,7 +3479,7 @@ export const useGeminiStream = (
 
       // Don't continue if model was switched due to quota error
       if (modelSwitchedFromQuotaError) {
-        return;
+        return false;
       }
 
       // Drain steerable user messages at this sampling boundary and append
@@ -3485,11 +3521,30 @@ export const useGeminiStream = (
         return;
       }
 
+      let settled = false;
+      let settleAcceptance: (accepted: boolean) => void = () => {};
+      const acceptance = new Promise<boolean>((resolve) => {
+        settleAcceptance = (accepted) => {
+          if (settled) return;
+          settled = true;
+          resolve(accepted);
+        };
+      });
+      void submitQuery(responsesToSend, SendMessageType.ToolResult, promptId, {
+        onContextAccepted: () => settleAcceptance(true),
+        onDeliveryFailed: () => settleAcceptance(false),
+      }).then(
+        () => settleAcceptance(false),
+        () => settleAcceptance(false),
+      );
+
       void submitQuery(responsesToSend, SendMessageType.ToolResult, promptId, {
         steerInput: drainedSteer,
         onDelivered: drainedSteer?.accept,
         onDeliveryFailed: drainedSteer?.restore,
       });
+
+      return acceptance;
     },
     [
       submitQuery,

@@ -5,8 +5,10 @@
  */
 
 import type { FunctionDeclaration } from '@google/genai';
+import { createHash } from 'node:crypto';
 import type {
   AnyDeclarativeTool,
+  DeferredToolPresentation,
   ToolResult,
   ToolResultDisplay,
   ToolInvocation,
@@ -25,6 +27,7 @@ import { safeJsonStringify } from '../utils/safeJsonStringify.js';
 import type { EventEmitter } from 'node:events';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import type { ReadResourceResult } from '@modelcontextprotocol/sdk/types.js';
+import { ToolNames } from './tool-names.js';
 
 type ToolParams = Record<string, unknown>;
 
@@ -35,6 +38,13 @@ export interface DeferredToolSummary {
   name: string;
   description: string;
   serverName?: string;
+}
+
+/** Returns the schema identity used to reject stale deferred presentations. */
+export function getFunctionSchemaFingerprint(
+  schema: FunctionDeclaration,
+): string {
+  return createHash('sha256').update(JSON.stringify(schema)).digest('hex');
 }
 
 const debugLogger = createDebugLogger('TOOL_REGISTRY');
@@ -193,6 +203,9 @@ export class ToolRegistry {
   // tool's schema is included in subsequent function-declaration lists even
   // though it would normally be hidden.
   private revealedDeferred: Set<string> = new Set();
+  // Current-schema fingerprints that have been shown to the model through
+  // ToolSearch and are therefore eligible for deferred_tool_call proxy routing.
+  private proxySchemaPresentations: Map<string, string> = new Map();
   private config: Config;
   private mcpClientManager: McpClientManager;
 
@@ -247,6 +260,12 @@ export class ToolRegistry {
    * @param tool - The tool object containing schema and execution logic.
    */
   registerTool(tool: AnyDeclarativeTool): void {
+    if (tool.name === ToolNames.DEFERRED_TOOL_CALL) {
+      debugLogger.warn(
+        `Tool "${ToolNames.DEFERRED_TOOL_CALL}" skipped: reserved Qwen Code tool name.`,
+      );
+      return;
+    }
     if (this.isToolDisabled(tool.name)) {
       debugLogger.info(
         `Tool "${tool.name}" skipped: present in disabledTools set.`,
@@ -297,7 +316,19 @@ export class ToolRegistry {
    * Registers a lazy tool factory. The tool module is not imported and the tool
    * is not instantiated until {@link ensureTool} or {@link warmAll} is called.
    */
-  registerFactory(name: string, factory: ToolFactory): void {
+  registerFactory(
+    name: string,
+    factory: ToolFactory,
+    options?: { allowReservedName?: boolean },
+  ): void {
+    if (
+      name === ToolNames.DEFERRED_TOOL_CALL &&
+      options?.allowReservedName !== true
+    ) {
+      throw new Error(
+        `"${ToolNames.DEFERRED_TOOL_CALL}" is a reserved Qwen Code tool name.`,
+      );
+    }
     if (this.isToolDisabled(name)) {
       debugLogger.info(
         `Tool factory "${name}" skipped: present in disabledTools set.`,
@@ -305,6 +336,11 @@ export class ToolRegistry {
       return;
     }
     this.factories.set(name, factory);
+  }
+
+  /** Removes a lazy factory before it has been instantiated. */
+  unregisterFactory(name: string): void {
+    this.factories.delete(name);
   }
 
   /**
@@ -392,6 +428,7 @@ export class ToolRegistry {
         // this a re-discovered tool of the same name would inherit
         // stale "revealed" state across the disconnect/reconnect.
         this.revealedDeferred.delete(tool.name);
+        this.proxySchemaPresentations.delete(tool.name);
       }
     }
   }
@@ -411,6 +448,7 @@ export class ToolRegistry {
         // checks reveal state) before the model has any way to know
         // the tool exists this session.
         this.revealedDeferred.delete(name);
+        this.proxySchemaPresentations.delete(name);
       }
     }
   }
@@ -540,6 +578,7 @@ export class ToolRegistry {
         // disconnect (would surface in declarations before any
         // ToolSearch call this session).
         this.revealedDeferred.delete(name);
+        this.proxySchemaPresentations.delete(name);
       }
     }
 
@@ -731,6 +770,42 @@ export class ToolRegistry {
     return this.revealedDeferred.has(name);
   }
 
+  isProxyEligibleDeferredTool(name: string): boolean {
+    const tool = this.tools.get(name);
+    return !!(
+      tool &&
+      tool.shouldDefer &&
+      !tool.alwaysLoad &&
+      !this.config.getVisibleTools().has(name)
+    );
+  }
+
+  markProxySchemaPresented(presentation: DeferredToolPresentation): boolean {
+    const tool = this.tools.get(presentation.name);
+    if (!tool || !this.isProxyEligibleDeferredTool(presentation.name)) {
+      return false;
+    }
+    const currentFingerprint = getFunctionSchemaFingerprint(tool.schema);
+    if (currentFingerprint !== presentation.schemaFingerprint) {
+      return false;
+    }
+    this.proxySchemaPresentations.set(presentation.name, currentFingerprint);
+    return true;
+  }
+
+  hasPresentedProxySchema(name: string): boolean {
+    const tool = this.tools.get(name);
+    if (!tool) return false;
+    return (
+      this.proxySchemaPresentations.get(name) ===
+      getFunctionSchemaFingerprint(tool.schema)
+    );
+  }
+
+  clearProxySchemaPresentations(): void {
+    this.proxySchemaPresentations.clear();
+  }
+
   /**
    * Whether a deferred tool is currently hidden from the model's
    * function-declaration list. Returns `true` when the tool:
@@ -757,6 +832,7 @@ export class ToolRegistry {
    */
   clearRevealedDeferredTools(): void {
     this.revealedDeferred.clear();
+    this.proxySchemaPresentations.clear();
   }
 
   /**
