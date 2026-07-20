@@ -90,6 +90,7 @@ import {
   LOAD_REPLAY_MODE_META_KEY,
   LOAD_REPLAY_PAGE_SIZE_META_KEY,
   LOAD_REPLAY_VERSION,
+  SESSION_STORAGE_CWD_META_KEY,
   TODO_STOP_GUARD_QUEUE_RELEASE_METHOD,
 } from './bridgeTypes.js';
 import type {
@@ -1148,7 +1149,10 @@ function extractPromptText(
   return hasImage ? '[image]' : '';
 }
 
-const DEFAULT_INIT_TIMEOUT_MS = 10_000;
+// Source-mode ACP children have to compile and initialize on every daemon
+// restart, so keep the production bound tight while allowing that dev-only
+// cold-start cost.
+const DEFAULT_INIT_TIMEOUT_MS = process.env['DEV'] === 'true' ? 30_000 : 10_000;
 const PERSIST_TIMEOUT_MS = 5_000;
 // Bounded retries for the sub-session `parentSessionId` transcript write on the
 // spawn critical path — a transport/timeout hiccup gets a couple more tries
@@ -2255,6 +2259,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
                 telemetry.injectPromptContext({
                   cwd: executionCwd,
                   mcpServers: [],
+                  // The ACP cwd controls runtime behavior; persistence stays
+                  // owned by the base workspace across daemon restarts.
+                  _meta: {
+                    [SESSION_STORAGE_CWD_META_KEY]: workspaceCwd,
+                  },
                 }),
               ),
               initTimeoutMs,
@@ -3967,9 +3976,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
                 // intentionally has no `mcpServers` field for the
                 // same reason.
                 mcpServers: [],
-                ...(historyReplay === 'response'
-                  ? {
-                      _meta: {
+                _meta: {
+                  [SESSION_STORAGE_CWD_META_KEY]: req.workspaceCwd,
+                  ...(historyReplay === 'response'
+                    ? {
                         [LOAD_REPLAY_MODE_META_KEY]: LOAD_REPLAY_BULK_MODE,
                         ...(req.historyPageSize !== undefined
                           ? {
@@ -3977,9 +3987,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
                                 req.historyPageSize,
                             }
                           : {}),
-                      },
-                    }
-                  : {}),
+                      }
+                    : {}),
+                },
               }),
               initTimeoutMs,
               'loadSession',
@@ -3993,6 +4003,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
                 sessionId: req.sessionId,
                 cwd: executionCwd,
                 mcpServers: [],
+                _meta: {
+                  [SESSION_STORAGE_CWD_META_KEY]: req.workspaceCwd,
+                },
               }),
               initTimeoutMs,
               'resumeSession',

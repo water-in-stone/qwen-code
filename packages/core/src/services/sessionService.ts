@@ -47,6 +47,7 @@ import {
 } from './session-artifact-persistence.js';
 import { SessionOrganizationService } from './session-organization-service.js';
 import { SessionTranscriptTooLargeError } from './session-transcript-reader.js';
+import { readWorktreeSession } from './worktreeSessionService.js';
 
 const debugLogger = createDebugLogger('SESSION');
 
@@ -382,6 +383,19 @@ export class SessionService {
     if (getProjectHash(recordCwd) === this.projectHash) {
       return true;
     }
+
+    // Worktree transcripts intentionally retain their execution cwd. A valid
+    // sidecar beside the transcript is the durable proof that this base
+    // workspace owns the otherwise foreign-looking session.
+    const activeWorktree = await readWorktreeSession(
+      this.getWorktreeSessionPathForState(sessionId, 'active'),
+    );
+    if (activeWorktree) return true;
+
+    const archivedWorktree = await readWorktreeSession(
+      this.getWorktreeSessionPathForState(sessionId, 'archived'),
+    );
+    if (archivedWorktree) return true;
 
     const status = await readRuntimeStatus(
       this.storage.getRuntimeStatusPath(sessionId),

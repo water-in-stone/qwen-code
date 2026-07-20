@@ -1488,6 +1488,8 @@ export async function loadCliConfig(
    * core decoupled from the CLI-owned `SettingsWatcher` implementation.
    */
   settingsWatcher?: { stopWatching(): void },
+  /** Persist session data under this workspace while tools run from cwd. */
+  sessionStorageDir?: string,
 ): Promise<Config> {
   const debugMode = isDebugMode(argv);
   if (debugMode && process.env['QWEN_DEBUG_LOG_FILE'] === undefined) {
@@ -1894,7 +1896,7 @@ export async function loadCliConfig(
   let sessionData: ResumedSessionData | undefined;
 
   if (argv.continue || argv.resume) {
-    const sessionService = new SessionService(cwd);
+    const sessionService = new SessionService(sessionStorageDir ?? cwd);
     if (argv.continue) {
       sessionData = await sessionService.loadLastSession();
       if (sessionData) {
@@ -1947,7 +1949,7 @@ export async function loadCliConfig(
   } else if (argv['sessionId']) {
     // Use provided session ID without session resumption
     // Check if session ID is already in use
-    const sessionService = new SessionService(cwd);
+    const sessionService = new SessionService(sessionStorageDir ?? cwd);
     const exists = await sessionService.sessionExistsInAnyState(
       argv['sessionId'],
     );
@@ -1987,6 +1989,7 @@ export async function loadCliConfig(
   const configParams: ConfigParameters = {
     sessionId,
     sessionData,
+    sessionStorageDir,
     embeddingModel: DEFAULT_QWEN_EMBEDDING_MODEL,
     sandbox: sandboxConfig,
     targetDir: cwd,

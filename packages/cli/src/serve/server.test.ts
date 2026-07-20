@@ -227,6 +227,7 @@ const EXPECTED_STAGE1_FEATURES = [
   'daemon_status',
   'capabilities',
   'session_create',
+  'session_start_in_worktree',
   'session_scope_override',
   'session_load',
   'session_resume',
@@ -8834,6 +8835,7 @@ describe('createServeApp', () => {
     async function writeStoredSession(input: {
       sessionId: string;
       cwd: string;
+      storageCwd?: string;
       timestamp: string;
       prompt: string;
       mtime: Date;
@@ -8843,7 +8845,7 @@ describe('createServeApp', () => {
       sourceId?: string;
     }): Promise<void> {
       const chatsDir = path.join(
-        new Storage(input.cwd).getProjectDir(),
+        new Storage(input.storageCwd ?? input.cwd).getProjectDir(),
         'chats',
         ...(input.state === 'archived' ? ['archive'] : []),
       );
@@ -9133,6 +9135,44 @@ describe('createServeApp', () => {
         ]),
       );
       expect(bridge.listCalls).toEqual([WS_BOUND]);
+    });
+
+    it('keeps persisted worktree sessions owned by the base workspace', async () => {
+      const sessionId = '72279fa6-6385-4ba7-9be4-d0cce2bd3328';
+      const executionCwd = path.join(WS_BOUND, '.qwen', 'worktrees', 'wt-a');
+      await writeStoredSession({
+        sessionId,
+        cwd: executionCwd,
+        storageCwd: WS_BOUND,
+        timestamp: '2026-05-17T12:00:00.000Z',
+        prompt: 'worktree prompt',
+        mtime: new Date('2026-05-17T12:10:00.000Z'),
+      });
+      await fsp.writeFile(
+        new SessionService(WS_BOUND).getWorktreeSessionPath(sessionId),
+        JSON.stringify({
+          slug: 'wt-a',
+          worktreePath: executionCwd,
+          worktreeBranch: 'worktree-wt-a',
+          originalCwd: WS_BOUND,
+          originalBranch: 'main',
+          originalHeadCommit: 'abc123',
+        }),
+        'utf8',
+      );
+
+      const result = await listWorkspaceSessionsForResponse(
+        fakeBridge(),
+        WS_BOUND,
+      );
+
+      expect(result.sessions).toEqual([
+        expect.objectContaining({
+          sessionId,
+          workspaceCwd: WS_BOUND,
+          executionCwd,
+        }),
+      ]);
     });
 
     it('preserves persisted createdAt when a live entry exists', async () => {

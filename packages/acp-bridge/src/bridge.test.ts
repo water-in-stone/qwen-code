@@ -75,6 +75,7 @@ import {
 import { SessionArtifactAuthorizationError } from './sessionArtifacts.js';
 import {
   MID_TURN_QUEUE_DRAIN_METHOD,
+  SESSION_STORAGE_CWD_META_KEY,
   TODO_STOP_GUARD_QUEUE_RELEASE_METHOD,
 } from './bridgeTypes.js';
 
@@ -2239,6 +2240,7 @@ describe('createAcpSessionBridge', () => {
         sessionId: 'persisted-1',
         cwd: WS_A,
         mcpServers: [],
+        _meta: { [SESSION_STORAGE_CWD_META_KEY]: WS_A },
       },
     ]);
     expect(bridge.sessionCount).toBe(1);
@@ -3290,7 +3292,12 @@ describe('createAcpSessionBridge', () => {
     });
     expect(handles[0]?.agent.loadSessionCalls).toHaveLength(0);
     expect(handles[0]?.agent.resumeSessionCalls).toEqual([
-      { sessionId: 'persisted-2', cwd: WS_A, mcpServers: [] },
+      {
+        sessionId: 'persisted-2',
+        cwd: WS_A,
+        mcpServers: [],
+        _meta: { [SESSION_STORAGE_CWD_META_KEY]: WS_A },
+      },
     ]);
 
     await bridge.shutdown();
@@ -4103,6 +4110,9 @@ describe('createAcpSessionBridge', () => {
     expect(executionCwds).toEqual([WS_A, worktreeA, worktreeB]);
     expect(handles).toHaveLength(3);
     expect(handles[1]?.agent.newSessionCalls[0]?.cwd).toBe(worktreeA);
+    expect(handles[1]?.agent.newSessionCalls[0]?._meta).toMatchObject({
+      [SESSION_STORAGE_CWD_META_KEY]: WS_A,
+    });
     expect(handles[2]?.agent.newSessionCalls[0]?.cwd).toBe(worktreeB);
     expect(worktree.workspaceCwd).toBe(WS_A);
     expect(worktree.executionCwd).toBe(worktreeA);

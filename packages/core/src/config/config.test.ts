@@ -512,6 +512,29 @@ describe('Server Config (config.ts)', () => {
   });
 
   describe('project-dir registry lifecycle', () => {
+    it('stores session data separately from the execution directory', () => {
+      const sessionStorageDir = path.resolve('/path/to/base-workspace');
+      const config = new Config({
+        ...baseParams,
+        sessionId: 'worktree-session',
+        sessionStorageDir,
+        chatRecording: true,
+      });
+
+      expect(config.getTargetDir()).toBe(path.resolve(TARGET_DIR));
+      expect(config.storage.getProjectRoot()).toBe(sessionStorageDir);
+      expect(config.getSessionService().getProjectRoot()).toBe(
+        sessionStorageDir,
+      );
+      expect(config.getTranscriptPath()).toBe(
+        path.join(
+          new Storage(sessionStorageDir).getProjectDir(),
+          'chats',
+          'worktree-session.jsonl',
+        ),
+      );
+    });
+
     it('drops its session entry on shutdown — no daemon leak', async () => {
       const sessionId = 'cfg-shutdown-test-session';
       const config = new Config({ ...baseParams, sessionId });

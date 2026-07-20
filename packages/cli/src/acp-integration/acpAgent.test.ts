@@ -1647,6 +1647,60 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     await agentPromise;
   });
 
+  it('keeps worktree execution cwd separate from session storage cwd', async () => {
+    const innerConfig = makeInnerConfig();
+    vi.mocked(loadCliConfig).mockResolvedValue(
+      innerConfig as unknown as Config,
+    );
+    vi.mocked(Session).mockImplementation(
+      (sessionId: string) =>
+        ({
+          getId: vi.fn().mockReturnValue(sessionId),
+          sendAvailableCommandsUpdate: vi.fn().mockResolvedValue(undefined),
+          replayHistory: vi.fn().mockResolvedValue(undefined),
+          installRewriter: vi.fn(),
+          startCronScheduler: vi.fn(),
+          dispose: vi.fn(),
+        }) as unknown as InstanceType<typeof Session>,
+    );
+
+    const agentPromise = runAcpAgent(
+      mockConfig,
+      makeSessionSettings(),
+      mockArgv,
+    );
+    await vi.waitFor(() => expect(capturedAgentFactory).toBeDefined());
+    const agent = capturedAgentFactory!({
+      get closed() {
+        return mockConnectionState.promise;
+      },
+    }) as AgentLike;
+
+    await agent.newSession({
+      cwd: '/workspace/.qwen/worktrees/wt-a',
+      mcpServers: [],
+      _meta: { 'qwen.session.storageCwd': '/workspace' },
+    });
+
+    expect(loadSettings).toHaveBeenCalledWith(
+      '/workspace/.qwen/worktrees/wt-a',
+    );
+    expect(loadCliConfig).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      '/workspace/.qwen/worktrees/wt-a',
+      undefined,
+      expect.anything(),
+      expect.any(Function),
+      expect.anything(),
+      undefined,
+      '/workspace',
+    );
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
   it('creates a session when OpenTelemetry is disabled', async () => {
     mockWithDaemonSpan.mockImplementationOnce(
       async (_name, _attributes, fn) => await fn(undefined),

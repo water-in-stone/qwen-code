@@ -1,16 +1,16 @@
-# Web Shell Start In 选择器
+# Web Shell Start In Selector
 
-## 概要
+## Summary
 
-实现 #6701：为 Web Shell 的全新会话增加执行上下文选择器，并提供真实的 git worktree 隔离。
+Implement #6701 by adding an execution-context selector for fresh Web Shell sessions, with real git worktree isolation.
 
-- UI 新增紧凑的 `Start In` 选择器：
+- Add a compact `Start In` selector to the UI:
   - `Work locally`
   - `New worktree`
-- `New worktree` 只影响未来创建的全新会话，不影响已加载、已恢复或正在运行的会话。
-- daemon 在启动会话前先创建 git worktree。
-- bridge 保留 base `workspaceCwd` 作为 workspace 归属与列表/路由 key，同时新增 `executionCwd` 表示子进程和会话实际运行目录。
-- ACP bridge channel 改为按 `executionCwd` 分组，确保 local session 和 worktree session 不会复用同一个 child process。
+- `New worktree` affects only future fresh sessions. It does not affect loaded, resumed, or active sessions.
+- The daemon creates the git worktree before starting the session.
+- The bridge retains the base `workspaceCwd` as the workspace ownership, listing, and routing key, while introducing `executionCwd` as the actual runtime directory for the child process and session.
+- ACP bridge channels are grouped by `executionCwd`, ensuring that local and worktree sessions never reuse the same child process.
 
 ```mermaid
 flowchart LR
@@ -19,94 +19,137 @@ flowchart LR
   SDK --> Route["POST /session<br/>base workspace route"]
   Route --> WT{"startIn"}
   WT -->|local| Local["executionCwd = workspaceCwd"]
-  WT -->|worktree| CreateWT["创建 .qwen/worktrees/<auto-slug><br/>写入 marker + sidecar + startup notice data"]
+  WT -->|worktree| CreateWT["Create .qwen/worktrees/<auto-slug><br/>write marker + sidecar + startup notice data"]
   CreateWT --> Exec["executionCwd = worktreePath"]
   Local --> Bridge["Bridge spawnOrAttach<br/>workspaceCwd = base<br/>executionCwd = runtime cwd"]
   Exec --> Bridge
-  Bridge --> Channels["ACP channels 按 executionCwd 分组"]
+  Bridge --> Channels["ACP channels grouped by executionCwd"]
   Channels --> Child["qwen --acp child<br/>cwd = executionCwd"]
-  Route --> Catalog["Session catalog/listing<br/>归属于 base workspaceCwd"]
+  Route --> Catalog["Session catalog/listing<br/>owned by base workspaceCwd"]
 ```
 
-## 关键改动
+## Key Changes
 
-1. 增加 `StartInMode = 'local' | 'worktree'`，并串联到：
+1. Add `StartInMode = 'local' | 'worktree'` and thread it through:
    - Web Shell `sessionPreparation`
    - `DaemonSessionActions.createSession`
    - SDK `CreateSessionRequest`
    - daemon `POST /session`
 
-2. bridge 拆分运行时目录语义：
-   - `workspaceCwd`：base workspace 归属 key，用于路由、列表、session storage、trust、workspace registry 匹配。
-   - `executionCwd`：实际会话运行目录，用于 ACP child spawn、shell command cwd、child-facing status、artifacts，以及所有路径敏感的 session 行为。
-   - `SessionEntry` 同时存储两个值。
-   - ACP channel 按 `executionCwd` 分组；相同 `executionCwd` 可以复用 channel，不同 worktree/local cwd 必须使用不同 child channel。
+2. Split the bridge's runtime-directory semantics:
+   - `workspaceCwd`: the base workspace ownership key, used for routing, listing, session storage, trust, and workspace registry matching.
+   - `executionCwd`: the actual session runtime directory, used for ACP child spawning, shell command cwd, child-facing status, artifacts, and all path-sensitive session behavior.
+   - `SessionEntry` stores both values.
+   - ACP channels are grouped by `executionCwd`. Sessions with the same `executionCwd` may reuse a channel, while different worktrees and the local cwd must use separate child channels.
 
-3. daemon 创建 worktree session：
-   - `startIn: 'worktree'` 时，基于 base repo 使用现有 `GitWorktreeService` 自动创建 worktree。
-   - 写入与 CLI worktree session 相同结构的 `WorktreeSession` sidecar。
-   - 写入/adopt worktree marker，确保 `exit_worktree` ownership 检查有效。
-   - 生成等价于 `buildStartupWorktreeNotice` 的 startup notice，并注入新会话首次 prompt 的初始上下文路径。
-   - 如果 worktree 创建、spawn、sidecar 写入、marker 写入或响应交付失败，则关闭刚创建的 fresh session，并 best-effort 删除本次请求刚创建的 worktree。
+3. Create worktree sessions in the daemon:
+   - For `startIn: 'worktree'`, create a worktree automatically from the base repository using the existing `GitWorktreeService`.
+   - Write a `WorktreeSession` sidecar with the same shape used by CLI worktree sessions.
+   - Write or adopt the worktree marker so that `exit_worktree` ownership checks remain valid.
+   - Generate a startup notice equivalent to `buildStartupWorktreeNotice` and inject it through the initial-context path of the new session's first prompt.
+   - If worktree creation, spawning, sidecar writing, marker writing, or response delivery fails, close the newly created fresh session and remove only the worktree created by that request on a best-effort basis.
 
-4. restore 行为：
-   - `load` / `resume` route 先解析 base workspace。
-   - bridge restore 前读取 base workspace 下的 session sidecar。
-   - 如果 sidecar 有效且 worktree 仍存在，则把 `executionCwd` 传给 bridge。
-   - 如果没有有效 sidecar，则按 local 恢复：`executionCwd = workspaceCwd`。
-   - session list 仍归属于 base workspace，可附带 worktree metadata 供展示/调试。
+4. Restore behavior:
+   - The `load` and `resume` routes resolve the base workspace first.
+   - Read the session sidecar from the base workspace before bridge restore.
+   - If the sidecar is valid and the worktree still exists, pass its path to the bridge as `executionCwd`.
+   - If no valid sidecar exists, restore locally with `executionCwd = workspaceCwd`.
+   - Session listings remain owned by the base workspace and may include worktree metadata for display or debugging.
 
-5. UI 行为：
-   - 在 ChatEditor toolbar/dropdown 风格中新增小型 `StartInSelector`。
-   - 只有 capability 和 workspace preflight 都表示可用时，才启用 `New worktree`。
-   - 不支持时选项仍显示，但 disabled，并通过 tooltip 解释原因。
-   - fresh session 创建成功后，选择器重置为 `Work locally`。
-   - 对已加载、已恢复、正在运行的 session，不显示也不修改当前 session mode。
+5. UI behavior:
+   - Add a compact `StartInSelector` using the existing ChatEditor toolbar and dropdown styles.
+   - Enable `New worktree` only when both the capability and workspace preflight report that it is available.
+   - When unsupported, keep the option visible but disabled and explain the reason in a tooltip.
+   - Reset the selector to `Work locally` after a fresh session is created successfully.
+   - Do not display or mutate the current session mode for loaded, resumed, or active sessions.
 
-## Preflight 与 Capability
+## Preflight And Capability
 
-- 新增 capability feature flag：`session_start_in_worktree`
-- 新增 preflight kind：`worktree`
-- daemon 的 `worktree` preflight 检查：
-  - git binary 可用；
-  - 当前 workspace 在 git repo 内；
-  - 可以解析 repo top-level；
-  - 当前 cwd 不在 `.qwen/worktrees` 内。
+- Add the capability feature flag `session_start_in_worktree`.
+- Add the preflight kind `worktree`.
+- The daemon's `worktree` preflight checks that:
+  - the git binary is available;
+  - the current workspace is inside a git repository;
+  - the repository top level can be resolved;
+  - the current cwd is not inside `.qwen/worktrees`.
 
-UI 只有在以下条件同时满足时启用 `New worktree`：
+The UI enables `New worktree` only when both conditions are met:
 
 - `capabilities.features.session_start_in_worktree === true`
-- preflight cell `kind === 'worktree' && status === 'ok'`
+- `kind === 'worktree' && status === 'ok'` for the preflight cell
 
-## 测试计划
+## Local Verification
 
-- SDK / webui 单测：
-  - `startIn` 能序列化到 `POST /session`
-  - `DaemonSessionActions.createSession` 正确转发 `startIn`
-  - `sessionPreparation` 带 workspace、approval mode 一起转发选中的 `startIn`
+Use a clean temporary Git repository so test artifacts do not affect the development workspace:
 
-- daemon route 单测：
-  - `local` 保持现有行为，`executionCwd = workspaceCwd`
-  - `worktree` 创建 auto worktree，写 marker/sidecar，注入 startup notice，并以 base `workspaceCwd` + worktree `executionCwd` 调用 bridge
-  - 非法 `startIn`、非 git repo、缺少 git、嵌套 worktree cwd 在 bridge spawn 前失败
-  - spawn failure、metadata failure、client disconnect 会清理 fresh worktree/session
+```bash
+export TEST_REPO="$(mktemp -d "${TMPDIR:-/tmp}/qwen-start-in-test.XXXXXX")"
+git -C "$TEST_REPO" init -b main
+git -C "$TEST_REPO" config user.name "Local Test"
+git -C "$TEST_REPO" config user.email "local-test@example.com"
+echo test >"$TEST_REPO/README.md"
+git -C "$TEST_REPO" add README.md
+git -C "$TEST_REPO" commit -m "initial commit"
+```
 
-- bridge 单测：
-  - workspace mismatch 仍基于 base `workspaceCwd` 校验
-  - channel 按 `executionCwd` 分组
-  - local + worktree、worktree + local、两个不同 worktree 都使用独立 child channel
-  - shell command、artifacts、child status 使用 `executionCwd`
-  - list/load/resume 仍归属于 base `workspaceCwd`
+Build and start Web Shell so the verification uses artifacts from the current branch:
 
-- Web Shell 单测：
-  - selector 渲染并可切换 mode
-  - 缺 capability/preflight 时 `New worktree` 禁用
-  - first prompt 使用选中的 `startIn` 创建 session
-  - active session 期间切换 selector 不迁移、不重建当前 session
+```bash
+npm run build && npm run bundle
+npm start -- serve \
+  --workspace "$TEST_REPO" \
+  --port 4170 \
+  --token local-test-token \
+  --open
+```
 
-## 假设与边界
+Verify the following with fresh sessions:
 
-- V1 只支持裸 `qwen --worktree` 自动 slug 语义；显式 slug 和 PR worktree 不在范围内。
-- active session migration 不在范围内。
-- 移动端 V1 使用现有 toolbar wrapping，不新增 overflow menu。
-- worktree cleanup 只对本次失败请求创建的 worktree 做 best-effort 清理；不会自动删除此前保留或复用的 worktree。
+1. `Start In` defaults to `Work locally`, and `New worktree` is available in a Git workspace.
+2. Create a session with `Work locally`: `workspaceCwd` is `$TEST_REPO`, and `executionCwd` is omitted.
+3. Start another fresh session and select `New worktree`: a worktree appears under `$TEST_REPO/.qwen/worktrees/<slug>`, while status reports `$TEST_REPO` as `workspaceCwd` and the worktree path as `executionCwd`.
+4. After successful session creation, the selector resets to `Work locally` for the next fresh session only. Loading an existing worktree session continues to use its original worktree as the execution directory.
+
+Inspect the runtime state with:
+
+```bash
+git -C "$TEST_REPO" worktree list
+curl -s -H 'Authorization: Bearer local-test-token' \
+  "http://127.0.0.1:4170/session/$SESSION_ID/status" |
+  jq '{sessionId, workspaceCwd, executionCwd}'
+```
+
+`npm run dev:daemon` cold-starts ACP children through `tsx`, so initialization may exceed the 10-second timeout for large workspaces. Prefer the bundle-based workflow above for local acceptance testing. When Vite hot reload is needed, set `QWEN_CLI_ENTRY="$PWD/dist/cli.js"` before running `npm run dev:daemon`.
+
+## Test Plan
+
+- SDK and webui unit tests:
+  - `startIn` serializes to `POST /session`.
+  - `DaemonSessionActions.createSession` forwards `startIn` correctly.
+  - `sessionPreparation` forwards the selected `startIn` together with the workspace and approval mode.
+
+- Daemon route unit tests:
+  - `local` preserves the existing behavior with `executionCwd = workspaceCwd`.
+  - `worktree` creates an automatic worktree, writes the marker and sidecar, injects the startup notice, and calls the bridge with the base `workspaceCwd` and worktree `executionCwd`.
+  - Invalid `startIn`, a non-Git repository, a missing git binary, and a nested worktree cwd fail before bridge spawn.
+  - Spawn failure, metadata failure, and client disconnect clean up the fresh worktree and session.
+
+- Bridge unit tests:
+  - Workspace mismatch validation still uses the base `workspaceCwd`.
+  - Channels are grouped by `executionCwd`.
+  - Local then worktree, worktree then local, and two different worktrees all use separate child channels.
+  - Shell commands, artifacts, and child status use `executionCwd`.
+  - List, load, and resume remain owned by the base `workspaceCwd`.
+
+- Web Shell unit tests:
+  - The selector renders and switches modes.
+  - `New worktree` is disabled without the capability or preflight.
+  - The first prompt creates the session with the selected `startIn`.
+  - Changing the selector during an active session neither migrates nor recreates that session.
+
+## Assumptions And Boundaries
+
+- V1 supports only the automatic-slug semantics of bare `qwen --worktree`; explicit slugs and PR worktrees are out of scope.
+- Active session migration is out of scope.
+- On mobile, V1 uses the existing toolbar wrapping and does not add a new overflow menu.
+- Worktree cleanup is best-effort and applies only to worktrees created by the failed request. Previously retained or reused worktrees are never removed automatically.

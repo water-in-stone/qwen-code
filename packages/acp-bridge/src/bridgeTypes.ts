@@ -164,6 +164,8 @@ export interface BridgeRestoreSessionRequest {
 export const LOAD_REPLAY_MODE_META_KEY = 'qwen.session.loadReplayMode';
 export const LOAD_REPLAY_META_KEY = 'qwen.session.loadReplay';
 export const LOAD_REPLAY_PAGE_SIZE_META_KEY = 'qwen.session.loadReplayPageSize';
+/** Base workspace that owns persistence when ACP executes in a worktree. */
+export const SESSION_STORAGE_CWD_META_KEY = 'qwen.session.storageCwd';
 export const LOAD_REPLAY_BULK_MODE = 'bulk';
 export const LOAD_REPLAY_VERSION = 1 as const;
 

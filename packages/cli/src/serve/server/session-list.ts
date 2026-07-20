@@ -272,21 +272,27 @@ function encodeMetadataSessionCursor(
   ).toString('base64url');
 }
 
-function toSummary(item: {
-  sessionId: string;
-  cwd: string;
-  startTime: string;
-  mtime: number;
-  prompt: string;
-  customTitle?: string;
-  parentSessionId?: string;
-  sourceType?: string;
-  sourceId?: string;
-  isArchived?: boolean;
-}): BridgeSessionSummary {
+function toSummary(
+  item: {
+    sessionId: string;
+    cwd: string;
+    startTime: string;
+    mtime: number;
+    prompt: string;
+    customTitle?: string;
+    parentSessionId?: string;
+    sourceType?: string;
+    sourceId?: string;
+    isArchived?: boolean;
+  },
+  workspaceCwd: string,
+): BridgeSessionSummary {
   return {
     sessionId: item.sessionId,
-    workspaceCwd: item.cwd,
+    // A worktree transcript records its runtime cwd, but the base workspace
+    // remains the catalog owner and therefore the sidebar grouping key.
+    workspaceCwd,
+    ...(item.cwd !== workspaceCwd ? { executionCwd: item.cwd } : {}),
     createdAt: item.startTime,
     updatedAt: new Date(item.mtime).toISOString(),
     displayName: item.customTitle || item.prompt,
@@ -345,7 +351,11 @@ async function listAllPersistedSummaries(
       archiveState,
     });
     const remaining = MAX_ORGANIZED_SESSIONS - sessions.length;
-    sessions.push(...page.items.slice(0, remaining).map(toSummary));
+    sessions.push(
+      ...page.items
+        .slice(0, remaining)
+        .map((item) => toSummary(item, sessionService.getProjectRoot())),
+    );
     cursor = page.nextCursor;
     if (page.items.length === 0) {
       break;
@@ -746,7 +756,7 @@ export async function listWorkspaceSessionsForResponse(
   const bySessionId = new Map<string, BridgeSessionSummary>();
 
   for (const item of persisted.items) {
-    bySessionId.set(item.sessionId, toSummary(item));
+    bySessionId.set(item.sessionId, toSummary(item, workspaceCwd));
   }
 
   if (archiveState === 'archived' || readOptions.mergeLive === false) {

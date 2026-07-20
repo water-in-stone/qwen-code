@@ -289,6 +289,7 @@ import {
   LOAD_REPLAY_MODE_META_KEY,
   LOAD_REPLAY_PAGE_SIZE_META_KEY,
   LOAD_REPLAY_VERSION,
+  SESSION_STORAGE_CWD_META_KEY,
   TODO_STOP_GUARD_QUEUE_RELEASE_METHOD,
   type ClientMcpOverWsRuntimeConfig,
   type BridgeLoadReplayEnvelope,
@@ -517,6 +518,19 @@ function getLoadReplayPageSize(params: LoadSessionRequest): number | undefined {
     );
   }
   return value as number;
+}
+
+function getSessionStorageCwd(params: {
+  cwd: string;
+  _meta?: unknown;
+}): string {
+  const meta = isObjectRecord(params._meta) ? params._meta : undefined;
+  const storageCwd = meta?.[SESSION_STORAGE_CWD_META_KEY];
+  // Non-daemon ACP clients do not send this extension. Falling back preserves
+  // the historical single-cwd behavior for those clients.
+  return typeof storageCwd === 'string' && path.isAbsolute(storageCwd)
+    ? path.resolve(storageCwd)
+    : params.cwd;
 }
 
 function isHistoryTurnStart(record: ChatRecord): boolean {
@@ -3411,6 +3425,7 @@ class QwenAgent implements Agent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     const { cwd, mcpServers } = params;
+    const sessionStorageCwd = getSessionStorageCwd(params);
     const parentContext = extractDaemonTraceContext(params);
     return await withDaemonSpan(
       'qwen-code.daemon.session_start',
@@ -3428,7 +3443,7 @@ class QwenAgent implements Agent {
         );
         this.settings = settings;
         const config = await profiler.time('config_setup', () =>
-          this.newSessionConfig(cwd, mcpServers, settings),
+          this.newSessionConfig(cwd, mcpServers, settings, sessionStorageCwd),
         );
         await profiler.time('auth', () => this.ensureAuthenticated(config));
         profiler.timeSync('file_system_setup', () =>
@@ -3455,11 +3470,12 @@ class QwenAgent implements Agent {
     // resolve `advanced.runtimeOutputDir` from THIS request's cwd, not from
     // whichever settings a concurrent handler loaded last.
     const settings = loadSettingsCached(params.cwd);
+    const sessionStorageCwd = getSessionStorageCwd(params);
     const exists = await runWithAcpRuntimeOutputDir(
       settings,
       params.cwd,
       async () => {
-        const sessionService = new SessionService(params.cwd);
+        const sessionService = new SessionService(sessionStorageCwd);
         return sessionService.sessionExists(params.sessionId);
       },
     );
@@ -3479,6 +3495,7 @@ class QwenAgent implements Agent {
       // a `null`/`undefined` would otherwise throw `TypeError`.
       params.mcpServers ?? [],
       settings,
+      sessionStorageCwd,
       params.sessionId,
       true,
     );
@@ -3577,11 +3594,12 @@ class QwenAgent implements Agent {
   ): Promise<ResumeSessionResponse> {
     // Same per-request settings discipline as `loadSession`.
     const settings = loadSettingsCached(params.cwd);
+    const sessionStorageCwd = getSessionStorageCwd(params);
     const exists = await runWithAcpRuntimeOutputDir(
       settings,
       params.cwd,
       async () => {
-        const sessionService = new SessionService(params.cwd);
+        const sessionService = new SessionService(sessionStorageCwd);
         return sessionService.sessionExists(params.sessionId);
       },
     );
@@ -3594,6 +3612,7 @@ class QwenAgent implements Agent {
       params.cwd,
       params.mcpServers ?? [],
       settings,
+      sessionStorageCwd,
       params.sessionId,
       true,
     );
@@ -9202,17 +9221,25 @@ class QwenAgent implements Agent {
     }
 
     const entry: TranscriptReplayConfigCacheEntry = { settings };
-    const pending = this.newSessionConfig(cwd, [], settings, undefined, false, {
-      skipMcpDiscovery: true,
-      skipHooks: true,
-      skipSkillManager: true,
-      skipFileCheckpointing: true,
-      // Read-only replay: tolerate tools that cannot construct without the
-      // subsystems skipped above (e.g. SkillTool needs the SkillManager). The
-      // registry is only consulted for optional tool_call metadata during
-      // replay, and ToolCallEmitter falls back to the recorded tool name.
-      lenientToolWarmup: true,
-    });
+    const pending = this.newSessionConfig(
+      cwd,
+      [],
+      settings,
+      undefined,
+      undefined,
+      false,
+      {
+        skipMcpDiscovery: true,
+        skipHooks: true,
+        skipSkillManager: true,
+        skipFileCheckpointing: true,
+        // Read-only replay: tolerate tools that cannot construct without the
+        // subsystems skipped above (e.g. SkillTool needs the SkillManager). The
+        // registry is only consulted for optional tool_call metadata during
+        // replay, and ToolCallEmitter falls back to the recorded tool name.
+        lenientToolWarmup: true,
+      },
+    );
     entry.pending = pending;
     this.transcriptReplayConfigCache.set(key, entry);
     try {
@@ -9245,6 +9272,7 @@ class QwenAgent implements Agent {
     cwd: string,
     mcpServers: McpServer[],
     settings: LoadedSettings,
+    sessionStorageDir?: string,
     sessionId?: string,
     resume?: boolean,
     initializeOptions: ConfigInitializeOptions = {},
@@ -9342,6 +9370,8 @@ class QwenAgent implements Agent {
       // into the first <available_skills> at cold start.
       buildDisabledSkillNamesProvider(settings),
       sessionMcpServers,
+      undefined,
+      sessionStorageDir,
     );
     // ACP sessions run with piped stdio (non-TTY), so the default
     // interactive-based gating disables file checkpointing. Enable it

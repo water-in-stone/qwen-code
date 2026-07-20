@@ -37,11 +37,13 @@ import { SessionOrganizationService } from './session-organization-service.js';
 import { CompressionStatus } from '../core/turn.js';
 import type { ChatRecord } from './chatRecordingService.js';
 import * as jsonl from '../utils/jsonl-utils.js';
+import { readWorktreeSession } from './worktreeSessionService.js';
 
 vi.mock('node:path');
 vi.mock('../utils/paths.js');
 vi.mock('../utils/runtimeStatus.js');
 vi.mock('../utils/jsonl-utils.js');
+vi.mock('./worktreeSessionService.js');
 
 describe('SessionService', () => {
   let sessionService: SessionService;
@@ -56,6 +58,7 @@ describe('SessionService', () => {
 
   beforeEach(() => {
     vi.mocked(getProjectHash).mockReturnValue('test-project-hash');
+    vi.mocked(readWorktreeSession).mockResolvedValue(null);
     vi.mocked(path.join).mockImplementation((...args) => args.join('/'));
     vi.mocked(path.dirname).mockImplementation((p) => {
       const parts = p.split('/');
@@ -193,6 +196,38 @@ describe('SessionService', () => {
       // sessionIdB should be first (more recent mtime)
       expect(result.items[0].sessionId).toBe(sessionIdB);
       expect(result.items[1].sessionId).toBe(sessionIdA);
+    });
+
+    it('lists a worktree transcript owned by this workspace sidecar', async () => {
+      const worktreeRecord = {
+        ...recordA1,
+        cwd: '/test/project/root/.qwen/worktrees/wt-a',
+      };
+      vi.mocked(getProjectHash).mockImplementation((cwd) =>
+        cwd === worktreeRecord.cwd
+          ? 'worktree-project-hash'
+          : 'test-project-hash',
+      );
+      vi.mocked(readWorktreeSession).mockImplementation(async (filePath) =>
+        filePath.endsWith(`${sessionIdA}.worktree.json`)
+          ? {
+              slug: 'wt-a',
+              worktreePath: worktreeRecord.cwd,
+              worktreeBranch: 'worktree-wt-a',
+              originalCwd: '/test/project/root',
+              originalBranch: 'main',
+              originalHeadCommit: 'abc123',
+            }
+          : null,
+      );
+      readdirSyncSpy.mockReturnValue([
+        `${sessionIdA}.jsonl`,
+      ] as unknown as Array<fs.Dirent<Buffer>>);
+      vi.mocked(jsonl.readLines).mockResolvedValue([worktreeRecord]);
+
+      const result = await sessionService.listSessions();
+
+      expect(result.items.map((item) => item.sessionId)).toEqual([sessionIdA]);
     });
 
     it('should ignore archive directory when listing active sessions', async () => {

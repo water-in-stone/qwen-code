@@ -866,6 +866,8 @@ export interface AgentsCollabSettings {
 export interface ConfigParameters {
   sessionId?: string;
   sessionData?: ResumedSessionData;
+  /** Base workspace that owns persistence while targetDir controls execution. */
+  sessionStorageDir?: string;
   embeddingModel?: string;
   sandbox?: SandboxConfig;
   targetDir: string;
@@ -1636,6 +1638,7 @@ export class Config {
   private readonly providerProtocolConfig?: ProviderProtocolConfig;
   private readonly sandbox: SandboxConfig | undefined;
   private targetDir: string;
+  private readonly sessionStorageDir: string | undefined;
   private workspaceContext: WorkspaceContext;
   private readonly debugMode: boolean;
   private readonly inputFormat: InputFormat;
@@ -1887,6 +1890,9 @@ export class Config {
     this.fileSystemService = new StandardFileSystemService();
     this.sandbox = params.sandbox;
     this.targetDir = path.resolve(params.targetDir);
+    this.sessionStorageDir = params.sessionStorageDir
+      ? path.resolve(params.sessionStorageDir)
+      : undefined;
     this.plansDirectoryConfigured = Boolean(params.plansDirectory?.trim());
     this.plansDir = Storage.getPlansDir(this.targetDir, params.plansDirectory);
     this.explicitIncludeDirectories = Array.from(
@@ -2125,11 +2131,11 @@ export class Config {
     this.jsonSchema = params.jsonSchema;
     this.inputFile = params.inputFile;
     this.defaultFileEncoding = params.defaultFileEncoding;
-    this.storage = new Storage(this.targetDir);
+    this.storage = new Storage(this.sessionStorageDir ?? this.targetDir);
     // Publish the project dir a subprocess needs to find this session's harness
-    // records. It is derived from the session's *launch* cwd, so a subprocess
-    // that has `cd`-ed elsewhere — which the /review skill explicitly does, into
-    // a PR worktree — cannot recompute it from `process.cwd()`; it would land on
+    // records. It is derived from the session's storage workspace, so a
+    // subprocess that has `cd`-ed elsewhere — as /review does when entering a
+    // PR worktree — cannot recompute it from `process.cwd()`; it would land on
     // a directory that never existed.
     //
     // Registered per session, not claimed in one process-global slot. In daemon
@@ -4056,7 +4062,9 @@ export class Config {
     }
 
     const oldStorage = this.storage;
-    if (!opts?.skipArtifactMigration) {
+    // Daemon worktree sessions deliberately keep their artifacts in the base
+    // workspace even when their runtime working directory changes.
+    if (!opts?.skipArtifactMigration && this.sessionStorageDir === undefined) {
       const newStorage = new Storage(expected);
       await this.prepareSessionArtifactMigration(
         oldStorage,
@@ -6192,7 +6200,9 @@ export class Config {
    */
   getSessionService(): SessionService {
     if (!this.sessionService) {
-      this.sessionService = new SessionService(this.targetDir);
+      this.sessionService = new SessionService(
+        this.sessionStorageDir ?? this.targetDir,
+      );
     }
     return this.sessionService;
   }
