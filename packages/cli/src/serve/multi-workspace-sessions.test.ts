@@ -185,12 +185,16 @@ function makeSummary(
 async function writeStoredSession(input: {
   sessionId: string;
   cwd: string;
+  storageCwd?: string;
   timestamp: string;
   prompt: string;
   mtime: Date;
   parentSessionId?: string;
 }): Promise<void> {
-  const chatsDir = path.join(new Storage(input.cwd).getProjectDir(), 'chats');
+  const chatsDir = path.join(
+    new Storage(input.storageCwd ?? input.cwd).getProjectDir(),
+    'chats',
+  );
   await fsp.mkdir(chatsDir, { recursive: true });
   const filePath = path.join(chatsDir, `${input.sessionId}.jsonl`);
   const records: Array<Record<string, unknown>> = [
@@ -202,6 +206,7 @@ async function writeStoredSession(input: {
       type: 'user',
       message: { role: 'user', parts: [{ text: input.prompt }] },
       cwd: input.cwd,
+      workspaceCwd: input.storageCwd ?? input.cwd,
     },
   ];
   if (input.parentSessionId !== undefined) {
@@ -1793,6 +1798,52 @@ describe('multi-workspace session dispatch', () => {
             }),
           },
         ]);
+      }),
+    15_000,
+  );
+
+  it(
+    'restores a worktree transcript locally after its sidecar is removed',
+    async () =>
+      await withRuntimeDir(async () => {
+        const repo = await initGitRepo();
+        const sessionId = 'removed-worktree-session';
+        const removedWorktree = path.join(
+          repo,
+          '.qwen',
+          'worktrees',
+          'removed',
+        );
+        await writeStoredSession({
+          sessionId,
+          cwd: removedWorktree,
+          storageCwd: repo,
+          timestamp: '2026-07-08T00:00:00.000Z',
+          prompt: 'continue locally',
+          mtime: new Date('2026-07-08T00:01:00.000Z'),
+        });
+        const { app, secondaryBridge } = makeHarness({
+          secondaryCwd: repo,
+          secondarySummaries: [],
+        });
+
+        await request(app)
+          .post(`/session/${sessionId}/load`)
+          .set('Host', host())
+          .send({ cwd: repo })
+          .expect(200);
+
+        expect(secondaryBridge.restoreCalls).toEqual([
+          {
+            action: 'load',
+            req: expect.not.objectContaining({
+              executionCwd: expect.anything(),
+            }),
+          },
+        ]);
+        expect(secondaryBridge.restoreCalls[0]?.req).toEqual(
+          expect.objectContaining({ sessionId, workspaceCwd: repo }),
+        );
       }),
     15_000,
   );

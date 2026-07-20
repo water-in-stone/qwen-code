@@ -1825,6 +1825,7 @@ export class Config {
   ) => Promise<void>;
   private initialized: boolean = false;
   storage: Storage;
+  private sessionStorage: Storage;
   private runtimeStatusWrite: Promise<void> = Promise.resolve();
   private readonly fileExclusions: FileExclusions;
   private readonly truncateToolOutputThreshold: number;
@@ -2131,7 +2132,8 @@ export class Config {
     this.jsonSchema = params.jsonSchema;
     this.inputFile = params.inputFile;
     this.defaultFileEncoding = params.defaultFileEncoding;
-    this.storage = new Storage(this.sessionStorageDir ?? this.targetDir);
+    this.storage = new Storage(this.targetDir);
+    this.sessionStorage = new Storage(this.sessionStorageDir ?? this.targetDir);
     // Publish the project dir a subprocess needs to find this session's harness
     // records. It is derived from the session's storage workspace, so a
     // subprocess that has `cd`-ed elsewhere — as /review does when entering a
@@ -2143,9 +2145,13 @@ export class Config {
     // booted first, and every later session would hand its subprocesses another
     // session's directory. The env var is still set for the single-session CLI,
     // where it is the only consumer and there is nothing to collide with.
-    registerSessionProjectDir(this.sessionId, this.storage.getProjectDir());
+    registerSessionProjectDir(
+      this.sessionId,
+      this.sessionStorage.getProjectDir(),
+    );
     if (!projectDirEnvClaimed && process.env) {
-      process.env['QWEN_CODE_PROJECT_DIR'] = this.storage.getProjectDir();
+      process.env['QWEN_CODE_PROJECT_DIR'] =
+        this.sessionStorage.getProjectDir();
       projectDirEnvClaimed = true;
     }
     this.inputFormat = params.inputFormat ?? InputFormat.TEXT;
@@ -4061,20 +4067,23 @@ export class Config {
       }
     }
 
-    const oldStorage = this.storage;
-    // Daemon worktree sessions deliberately keep their artifacts in the base
-    // workspace even when their runtime working directory changes.
+    const oldSessionStorage = this.sessionStorage;
+    const newExecutionStorage = new Storage(expected);
     if (!opts?.skipArtifactMigration && this.sessionStorageDir === undefined) {
-      const newStorage = new Storage(expected);
       await this.prepareSessionArtifactMigration(
-        oldStorage,
-        newStorage,
+        oldSessionStorage,
+        newExecutionStorage,
         oldDir,
         opts,
       );
-      this.storage = newStorage;
+      this.sessionStorage = newExecutionStorage;
       this.chatRecordingService?.resetStoragePaths();
+      registerSessionProjectDir(
+        this.sessionId,
+        this.sessionStorage.getProjectDir(),
+      );
     }
+    this.storage = newExecutionStorage;
 
     this.targetDir = expected;
     this.cwd = expected;
@@ -4118,6 +4127,15 @@ export class Config {
 
   getProjectRoot(): string {
     return this.targetDir;
+  }
+
+  /** Base workspace that owns this session's durable transcript and catalog. */
+  getSessionStorageRoot(): string {
+    return this.sessionStorage.getProjectRoot();
+  }
+
+  getSessionProjectDir(): string {
+    return this.sessionStorage.getProjectDir();
   }
 
   getCwd(): string {
@@ -6189,7 +6207,7 @@ export class Config {
     if (!this.chatRecordingEnabled) {
       return '';
     }
-    const projectDir = this.storage.getProjectDir();
+    const projectDir = this.sessionStorage.getProjectDir();
     const sessionId = this.getSessionId();
     const safeFilename = `${sessionId}.jsonl`;
     return path.join(projectDir, 'chats', safeFilename);
@@ -6200,9 +6218,7 @@ export class Config {
    */
   getSessionService(): SessionService {
     if (!this.sessionService) {
-      this.sessionService = new SessionService(
-        this.sessionStorageDir ?? this.targetDir,
-      );
+      this.sessionService = new SessionService(this.getSessionStorageRoot());
     }
     return this.sessionService;
   }

@@ -522,10 +522,43 @@ describe('Server Config (config.ts)', () => {
       });
 
       expect(config.getTargetDir()).toBe(path.resolve(TARGET_DIR));
-      expect(config.storage.getProjectRoot()).toBe(sessionStorageDir);
+      expect(config.storage.getProjectRoot()).toBe(path.resolve(TARGET_DIR));
+      expect(config.storage.getProjectWorkflowsDir()).toBe(
+        path.join(path.resolve(TARGET_DIR), '.qwen', 'workflows'),
+      );
+      expect(config.storage.getProjectCommandsDir()).toBe(
+        path.join(path.resolve(TARGET_DIR), '.qwen', 'commands'),
+      );
+      expect(config.getSessionStorageRoot()).toBe(sessionStorageDir);
       expect(config.getSessionService().getProjectRoot()).toBe(
         sessionStorageDir,
       );
+      expect(config.getTranscriptPath()).toBe(
+        path.join(
+          new Storage(sessionStorageDir).getProjectDir(),
+          'chats',
+          'worktree-session.jsonl',
+        ),
+      );
+    });
+
+    it('keeps session persistence fixed when ACP changes execution cwd', async () => {
+      const sessionStorageDir = path.resolve('/path/to/base-workspace');
+      const newDir = path.resolve('/path/to/other-worktree');
+      const config = new Config({
+        ...baseParams,
+        sessionId: 'worktree-session',
+        sessionStorageDir,
+        chatRecording: true,
+      });
+
+      await config.relocateWorkingDirectory(newDir, newDir, {
+        skipProcessChdir: true,
+        skipArtifactMigration: true,
+      });
+
+      expect(config.storage.getProjectRoot()).toBe(newDir);
+      expect(config.getSessionStorageRoot()).toBe(sessionStorageDir);
       expect(config.getTranscriptPath()).toBe(
         path.join(
           new Storage(sessionStorageDir).getProjectDir(),

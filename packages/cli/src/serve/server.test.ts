@@ -8859,6 +8859,7 @@ describe('createServeApp', () => {
         type: 'user',
         message: { role: 'user', parts: [{ text: input.prompt }] },
         cwd: input.cwd,
+        workspaceCwd: input.storageCwd ?? input.cwd,
       };
       const lines = [JSON.stringify(record)];
       if (input.parentSessionId !== undefined) {
@@ -9160,6 +9161,32 @@ describe('createServeApp', () => {
         }),
         'utf8',
       );
+
+      const result = await listWorkspaceSessionsForResponse(
+        fakeBridge(),
+        WS_BOUND,
+      );
+
+      expect(result.sessions).toEqual([
+        expect.objectContaining({
+          sessionId,
+          workspaceCwd: WS_BOUND,
+          executionCwd,
+        }),
+      ]);
+    });
+
+    it('keeps a worktree transcript after its temporary sidecar is removed', async () => {
+      const sessionId = '1cf54e84-1715-4b27-b9ae-e41fe54f747f';
+      const executionCwd = path.join(WS_BOUND, '.qwen', 'worktrees', 'removed');
+      await writeStoredSession({
+        sessionId,
+        cwd: executionCwd,
+        storageCwd: WS_BOUND,
+        timestamp: '2026-05-17T12:00:00.000Z',
+        prompt: 'worktree prompt',
+        mtime: new Date('2026-05-17T12:10:00.000Z'),
+      });
 
       const result = await listWorkspaceSessionsForResponse(
         fakeBridge(),

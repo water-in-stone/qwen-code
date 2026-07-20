@@ -49,6 +49,10 @@ describe('ChatRecordingService', () => {
     mockConfig = {
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getProjectRoot: vi.fn().mockReturnValue('/test/project/root'),
+      getSessionStorageRoot: vi.fn().mockReturnValue('/test/base-workspace'),
+      getSessionProjectDir: vi
+        .fn()
+        .mockReturnValue('/test/base-runtime/projects/test-project'),
       getCliVersion: vi.fn().mockReturnValue('1.0.0'),
       storage: {
         getProjectTempDir: vi
@@ -115,8 +119,20 @@ describe('ChatRecordingService', () => {
       expect(record.message).toEqual({ role: 'user', parts: userParts });
       expect(record.sessionId).toBe('test-session-id');
       expect(record.cwd).toBe('/test/project/root');
+      expect(record.workspaceCwd).toBe('/test/base-workspace');
       expect(record.version).toBe('1.0.0');
       expect(record.gitBranch).toBe('main');
+    });
+
+    it('records workspace ownership only on the transcript root', async () => {
+      chatRecordingService.recordUserMessage([{ text: 'first' }]);
+      chatRecordingService.recordUserMessage([{ text: 'second' }]);
+      await chatRecordingService.flush();
+
+      const first = vi.mocked(jsonl.writeLine).mock.calls[0][1] as ChatRecord;
+      const second = vi.mocked(jsonl.writeLine).mock.calls[1][1] as ChatRecord;
+      expect(first.workspaceCwd).toBe('/test/base-workspace');
+      expect(second.workspaceCwd).toBeUndefined();
     });
 
     it('should chain messages correctly with parentUuid', async () => {

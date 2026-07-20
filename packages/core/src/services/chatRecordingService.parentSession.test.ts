@@ -40,6 +40,10 @@ describe('ChatRecordingService - recordParentSession', () => {
     mockConfig = {
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getProjectRoot: vi.fn().mockReturnValue('/test/project/root'),
+      getSessionStorageRoot: vi.fn().mockReturnValue('/test/project/root'),
+      getSessionProjectDir: vi
+        .fn()
+        .mockReturnValue('/test/project/root/.gemini/projects/test-project'),
       getCliVersion: vi.fn().mockReturnValue('1.0.0'),
       storage: {
         getProjectTempDir: vi

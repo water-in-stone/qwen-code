@@ -378,15 +378,22 @@ export class SessionService {
 
   private async sessionBelongsToCurrentProject(
     sessionId: string,
-    recordCwd: string,
+    record: Pick<ChatRecord, 'cwd' | 'workspaceCwd'>,
   ): Promise<boolean> {
-    if (getProjectHash(recordCwd) === this.projectHash) {
+    if (record.workspaceCwd !== undefined) {
+      return (
+        typeof record.workspaceCwd === 'string' &&
+        path.isAbsolute(record.workspaceCwd) &&
+        getProjectHash(record.workspaceCwd) === this.projectHash
+      );
+    }
+
+    if (getProjectHash(record.cwd) === this.projectHash) {
       return true;
     }
 
-    // Worktree transcripts intentionally retain their execution cwd. A valid
-    // sidecar beside the transcript is the durable proof that this base
-    // workspace owns the otherwise foreign-looking session.
+    // Legacy worktree transcripts predate workspaceCwd, so retain their
+    // sidecar/runtime-status ownership fallback during migration.
     const activeWorktree = await readWorktreeSession(
       this.getWorktreeSessionPathForState(sessionId, 'active'),
     );
@@ -426,7 +433,7 @@ export class SessionService {
       }
       const firstRecord = records[0];
       if (
-        !(await this.sessionBelongsToCurrentProject(sessionId, firstRecord.cwd))
+        !(await this.sessionBelongsToCurrentProject(sessionId, firstRecord))
       ) {
         return undefined;
       }
@@ -468,7 +475,7 @@ export class SessionService {
         if (
           !(await this.sessionBelongsToCurrentProject(
             records[0].sessionId,
-            records[0].cwd,
+            records[0],
           ))
         ) {
           continue;
@@ -849,10 +856,7 @@ export class SessionService {
       const firstRecords = await jsonl.readLines<ChatRecord>(filePath, 1);
       if (firstRecords.length === 0) return 0;
       if (
-        !(await this.sessionBelongsToCurrentProject(
-          sessionId,
-          firstRecords[0].cwd,
-        ))
+        !(await this.sessionBelongsToCurrentProject(sessionId, firstRecords[0]))
       ) {
         return 0;
       }
@@ -986,7 +990,7 @@ export class SessionService {
       if (
         !(await this.sessionBelongsToCurrentProject(
           firstRecord.sessionId,
-          firstRecord.cwd,
+          firstRecord,
         ))
       ) {
         continue;
@@ -1096,7 +1100,7 @@ export class SessionService {
         if (
           !(await this.sessionBelongsToCurrentProject(
             firstRecord.sessionId,
-            firstRecord.cwd,
+            firstRecord,
           ))
         ) {
           continue;
@@ -1289,7 +1293,7 @@ export class SessionService {
     if (
       !(await this.sessionBelongsToCurrentProject(
         firstRecord.sessionId,
-        firstRecord.cwd,
+        firstRecord,
       ))
     ) {
       return;
@@ -1648,9 +1652,7 @@ export class SessionService {
         return false;
       }
 
-      if (
-        !(await this.sessionBelongsToCurrentProject(sessionId, records[0].cwd))
-      ) {
+      if (!(await this.sessionBelongsToCurrentProject(sessionId, records[0]))) {
         return false;
       }
 
@@ -1727,10 +1729,7 @@ export class SessionService {
     }
 
     if (
-      !(await this.sessionBelongsToCurrentProject(
-        sourceSessionId,
-        records[0].cwd,
-      ))
+      !(await this.sessionBelongsToCurrentProject(sourceSessionId, records[0]))
     ) {
       throw new Error(
         `Source session does not belong to current project: ${sourceSessionId}`,
@@ -1960,7 +1959,7 @@ export class SessionService {
       if (
         !(await this.sessionBelongsToCurrentProject(
           firstRecord.sessionId,
-          firstRecord.cwd,
+          firstRecord,
         ))
       ) {
         continue;
@@ -2039,7 +2038,7 @@ export class SessionService {
         if (
           !(await this.sessionBelongsToCurrentProject(
             records[0].sessionId,
-            records[0].cwd,
+            records[0],
           ))
         ) {
           continue;
@@ -2088,7 +2087,7 @@ export class SessionService {
       if (records.length === 0) {
         return false;
       }
-      return this.sessionBelongsToCurrentProject(sessionId, records[0].cwd);
+      return this.sessionBelongsToCurrentProject(sessionId, records[0]);
     } catch {
       return false;
     }

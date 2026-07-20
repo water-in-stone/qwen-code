@@ -60,6 +60,9 @@ describe('SessionService', () => {
     vi.mocked(getProjectHash).mockReturnValue('test-project-hash');
     vi.mocked(readWorktreeSession).mockResolvedValue(null);
     vi.mocked(path.join).mockImplementation((...args) => args.join('/'));
+    vi.mocked(path.isAbsolute).mockImplementation((value) =>
+      value.startsWith('/'),
+    );
     vi.mocked(path.dirname).mockImplementation((p) => {
       const parts = p.split('/');
       parts.pop();
@@ -228,6 +231,48 @@ describe('SessionService', () => {
       const result = await sessionService.listSessions();
 
       expect(result.items.map((item) => item.sessionId)).toEqual([sessionIdA]);
+    });
+
+    it('lists a worktree transcript from its durable workspace owner', async () => {
+      const worktreeRecord: ChatRecord = {
+        ...recordA1,
+        cwd: '/test/project/root/.qwen/worktrees/wt-a',
+        workspaceCwd: '/test/project/root',
+      };
+      vi.mocked(getProjectHash).mockImplementation((cwd) =>
+        cwd === worktreeRecord.cwd
+          ? 'worktree-project-hash'
+          : 'test-project-hash',
+      );
+      readdirSyncSpy.mockReturnValue([
+        `${sessionIdA}.jsonl`,
+      ] as unknown as Array<fs.Dirent<Buffer>>);
+      vi.mocked(jsonl.readLines).mockResolvedValue([worktreeRecord]);
+
+      const result = await sessionService.listSessions();
+
+      expect(readWorktreeSession).not.toHaveBeenCalled();
+      expect(result.items.map((item) => item.sessionId)).toEqual([sessionIdA]);
+    });
+
+    it('rejects a transcript whose durable owner is another workspace', async () => {
+      const foreignRecord: ChatRecord = {
+        ...recordA1,
+        workspaceCwd: '/test/other-project',
+      };
+      vi.mocked(getProjectHash).mockImplementation((cwd) =>
+        cwd === foreignRecord.workspaceCwd
+          ? 'other-project-hash'
+          : 'test-project-hash',
+      );
+      readdirSyncSpy.mockReturnValue([
+        `${sessionIdA}.jsonl`,
+      ] as unknown as Array<fs.Dirent<Buffer>>);
+      vi.mocked(jsonl.readLines).mockResolvedValue([foreignRecord]);
+
+      const result = await sessionService.listSessions();
+
+      expect(result.items).toEqual([]);
     });
 
     it('should ignore archive directory when listing active sessions', async () => {
@@ -605,6 +650,28 @@ describe('SessionService', () => {
       expect(loaded?.conversation.messages[0].uuid).toBe('b1');
       expect(loaded?.conversation.messages[1].uuid).toBe('b2');
       expect(loaded?.lastCompletedUuid).toBe('b2');
+    });
+
+    it('loads a worktree transcript from its durable workspace owner', async () => {
+      const worktreeRoot = '/test/project/root/.qwen/worktrees/wt-b';
+      const records: ChatRecord[] = [
+        {
+          ...recordB1,
+          cwd: worktreeRoot,
+          workspaceCwd: '/test/project/root',
+        },
+        { ...recordB2, cwd: worktreeRoot },
+      ];
+      vi.mocked(getProjectHash).mockImplementation((cwd) =>
+        cwd === worktreeRoot ? 'worktree-project-hash' : 'test-project-hash',
+      );
+      vi.mocked(jsonl.read).mockResolvedValue(records);
+
+      const loaded = await sessionService.loadSession(sessionIdB);
+
+      expect(readWorktreeSession).not.toHaveBeenCalled();
+      expect(loaded?.conversation.sessionId).toBe(sessionIdB);
+      expect(loaded?.conversation.messages).toHaveLength(2);
     });
 
     it('reads archived sessions only through the explicit read-only method', async () => {

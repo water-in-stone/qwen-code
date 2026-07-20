@@ -262,6 +262,8 @@ export interface ChatRecord {
     | 'session_artifact_snapshot';
   /** Working directory at time of message */
   cwd: string;
+  /** Base workspace that permanently owns this transcript. Root record only. */
+  workspaceCwd?: string;
   /** CLI version for compatibility tracking */
   version: string;
   /** Current git branch, if available */
@@ -682,7 +684,7 @@ export class ChatRecordingService {
    * @throws Error if the directory cannot be created.
    */
   private ensureChatsDir(): string {
-    const projectDir = this.config.storage.getProjectDir();
+    const projectDir = this.config.getSessionProjectDir();
     const chatsDir = path.join(projectDir, 'chats');
 
     if (this.chatsDirEnsured) {
@@ -740,13 +742,17 @@ export class ChatRecordingService {
     type: ChatRecord['type'],
   ): Omit<ChatRecord, 'message' | 'tokens' | 'model' | 'toolCallsMetadata'> {
     const cwd = this.config.getProjectRoot();
+    const parentUuid = this.lastRecordUuid;
     return {
       uuid: randomUUID(),
-      parentUuid: this.lastRecordUuid,
+      parentUuid,
       sessionId: this.getSessionId(),
       timestamp: new Date().toISOString(),
       type,
       cwd,
+      ...(parentUuid === null
+        ? { workspaceCwd: this.config.getSessionStorageRoot() }
+        : {}),
       version: this.config.getCliVersion() || 'unknown',
       gitBranch: this.getCachedGitBranch(cwd),
     };

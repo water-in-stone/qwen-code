@@ -39,6 +39,7 @@ flowchart LR
 2. Split the bridge's runtime-directory semantics:
    - `workspaceCwd`: the base workspace ownership key, used for routing, listing, session storage, trust, and workspace registry matching.
    - `executionCwd`: the actual session runtime directory, used for ACP child spawning, shell command cwd, child-facing status, artifacts, and all path-sensitive session behavior.
+   - ACP child configuration keeps execution storage rooted at `executionCwd` while transcript and catalog persistence remain rooted at `workspaceCwd`.
    - `SessionEntry` stores both values.
    - ACP channels are grouped by `executionCwd`. Sessions with the same `executionCwd` may reuse a channel, while different worktrees and the local cwd must use separate child channels.
 
@@ -54,6 +55,7 @@ flowchart LR
    - Read the session sidecar from the base workspace before bridge restore.
    - If the sidecar is valid and the worktree still exists, pass its path to the bridge as `executionCwd`.
    - If no valid sidecar exists, restore locally with `executionCwd = workspaceCwd`.
+   - The transcript root record stores its durable `workspaceCwd`; the worktree sidecar is only a temporary execution binding and may be removed without orphaning the session.
    - Session listings remain owned by the base workspace and may include worktree metadata for display or debugging.
 
 5. UI behavior:
