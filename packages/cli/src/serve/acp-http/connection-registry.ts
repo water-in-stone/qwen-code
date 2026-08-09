@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { writeStderrLine } from '../../utils/stdioHelpers.js';
-import { logSafe } from './json-rpc.js';
+import { logSafe, type JsonRpcId } from './json-rpc.js';
 import type { TransportStream } from './transport-stream.js';
 
 /**
@@ -101,13 +101,11 @@ export interface SessionBinding {
    * event-starved.
    */
   abort: AbortController;
-  /**
-   * Aborts the in-flight `session/prompt` for this session. Set by
-   * `handlePrompt` while a prompt runs; aborted on `session/cancel` and on
-   * session/connection teardown so a disconnecting client doesn't leave
-   * the agent burning model quota on a result nobody will read.
-   */
-  promptAbort?: AbortController;
+  /** Prompts submitted through this ACP connection, keyed by bridge prompt id. */
+  promptRequests: Map<
+    string,
+    { controller: AbortController; requestId: JsonRpcId | undefined }
+  >;
   /**
    * Armed by `detachSessionStream` when the session stream closes at the
    * transport level (proxy idle-close, network blip) WITHOUT an explicit
@@ -291,7 +289,12 @@ export class AcpConnection {
   getOrCreateSession(sessionId: string): SessionBinding {
     let binding = this.sessions.get(sessionId);
     if (!binding) {
-      binding = { sessionId, abort: new AbortController(), buffer: [] };
+      binding = {
+        sessionId,
+        abort: new AbortController(),
+        buffer: [],
+        promptRequests: new Map(),
+      };
       this.sessions.set(sessionId, binding);
     }
     return binding;
@@ -796,7 +799,10 @@ export class AcpConnection {
       binding.graceTimer = undefined;
     }
     binding.abort.abort();
-    binding.promptAbort?.abort();
+    for (const { controller } of binding.promptRequests.values()) {
+      controller.abort();
+    }
+    binding.promptRequests.clear();
     // Don't close the stream if it's the shared connStream (WS reuses
     // one socket for all sessions — closing it kills the entire connection).
     if (binding.stream && binding.stream !== this.connStream) {

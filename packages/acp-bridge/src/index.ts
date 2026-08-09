@@ -25,3 +25,4 @@ export * from './bridgeClient.js';
 export * from './bridge.js';
 export * from './bridgeFileSystem.js';
 export * from './generation-stream.js';
+export * from './promptQueueProtocol.js';

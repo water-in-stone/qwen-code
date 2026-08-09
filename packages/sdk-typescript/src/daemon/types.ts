@@ -3142,6 +3142,7 @@ export interface DaemonMidTurnMessagesResult {
  */
 export interface DaemonPendingPromptSummary {
   promptId: string;
+  clientPromptId?: string;
   text: string;
   queuedAt: number;
   state: 'queued' | 'running';

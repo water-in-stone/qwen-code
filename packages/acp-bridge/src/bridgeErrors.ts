@@ -262,8 +262,9 @@ export class PromptQueueFullError extends Error {
 /**
  * Rejected by `sendPrompt` when an accepted prompt exceeds its wallclock
  * deadline (`BridgeClientRequestContext.deadlineMs`). The bridge publishes a
- * `turn_error{code:'prompt_deadline_exceeded'}` terminal, releases the FIFO,
- * and best-effort cancels the agent — the agent may still be executing.
+ * `turn_error{code:'prompt_deadline_exceeded'}` terminal, settles the caller,
+ * and best-effort cancels the agent. A dispatched child request retains the
+ * FIFO executor fence until it actually settles or its transport closes.
  * Exported so tests and routes can match on the class identity.
  */
 export class PromptDeadlineExceededError extends Error {

@@ -107,6 +107,7 @@ import {
   type DiscoveredMCPPrompt,
   type DiscoveredMCPResource,
   type HookConfig,
+  type InvocationContextV1,
   type McpBudgetEvent,
   type McpBudgetMode,
   type McpClientManager,
@@ -174,6 +175,24 @@ import {
 } from './authMethods.js';
 import { AcpFileSystemService } from './service/filesystem.js';
 import { ndJsonStream } from '@qwen-code/acp-bridge/ndJsonStream';
+import {
+  DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION,
+  InvalidPromptQueueMetadataError,
+  PENDING_PROMPT_ADDED_EVENT,
+  PENDING_PROMPT_COMPLETED_EVENT,
+  PENDING_PROMPT_STARTED_EVENT,
+  PROMPT_QUEUE_LIST_METHOD,
+  PROMPT_QUEUE_NOTIFICATION_METHOD,
+  PROMPT_QUEUE_PROTOCOL_VERSION,
+  PROMPT_QUEUE_REMOVE_METHOD,
+  addPromptQueueCapabilityToMeta,
+  buildPendingPromptAddedData,
+  buildPendingPromptCompletedData,
+  buildPendingPromptStartedData,
+  buildPromptQueueFullErrorData,
+  isValidPromptQueueServerId,
+  parseAndStripPromptQueueMetadata,
+} from '@qwen-code/acp-bridge/promptQueueProtocol';
 import {
   ACP_EVENT_LOOP_STALL_RESTART_MS,
   CHANNEL_PROMPT_META_KEY,
@@ -581,13 +600,14 @@ async function waitForSessionDrain(
   operation: Promise<void>,
   timeoutMs: number,
   kind: 'close' | 'restore',
+  onTimeout?: () => void,
 ): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`Session ${kind} timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
+    timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(`Session ${kind} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
     timer.unref();
   });
   try {
@@ -3772,9 +3792,42 @@ interface PendingMcpAuthentication {
   }>;
 }
 
-interface ActivePromptCall {
+interface AcpPromptQueueEntry {
+  promptId: string;
+  clientPromptId?: string;
+  params?: PromptRequest;
+  invocationContext?: InvocationContextV1;
+  modelPrompt?: string;
+  text?: string;
+  queuedAt: number;
+  state: 'queued' | 'running' | 'removed';
+  wasQueued: boolean;
+  callerSettled: boolean;
   controller: AbortController;
-  settled: Promise<void>;
+  executorSettled: Promise<void>;
+  settleExecutor: () => void;
+  resolve: (response: PromptResponse) => void;
+  reject: (reason: unknown) => void;
+}
+
+interface AcpPromptQueueState {
+  session: Session;
+  entries: AcpPromptQueueEntry[];
+  draining: boolean;
+  admissionClosed: boolean;
+  invalidated: boolean;
+  drainCompletion?: Promise<void>;
+}
+
+const ACP_PROMPT_CANCEL_ABORT_REASON = 'qwen:user-cancel';
+
+function extractDirectPromptText(prompt: PromptRequest['prompt']): string {
+  let hasImage = false;
+  for (const block of prompt) {
+    if (block.type === 'image') hasImage = true;
+    if (block.type === 'text' && block.text.length > 0) return block.text;
+  }
+  return hasImage ? '[image]' : '';
 }
 
 function isOwnerOnlyDirectory(stats: Stats): boolean {
@@ -3788,9 +3841,9 @@ function isOwnerOnlyDirectory(stats: Stats): boolean {
 
 class QwenAgent implements Agent {
   private sessions: Map<string, Session> = new Map();
-  private readonly historyMutationTails = new Map<string, Promise<void>>();
   private readonly startingSessionIds = new Set<string>();
-  private activePromptCalls = new Map<string, Set<ActivePromptCall>>();
+  private readonly historyMutationTails = new Map<string, Promise<void>>();
+  private readonly promptQueues = new Map<string, AcpPromptQueueState>();
   private workspaceMcpDiscoveryConfig: Config | undefined;
   private workspaceMcpDiscoveryPromise: Promise<void> | undefined;
   private workspaceMcpDiscoveryError: string | undefined;
@@ -3865,6 +3918,249 @@ class QwenAgent implements Agent {
     return [...this.sessions.values()];
   }
 
+  private createPromptQueueState(session: Session): AcpPromptQueueState {
+    const state: AcpPromptQueueState = {
+      session,
+      entries: [],
+      draining: false,
+      admissionClosed: false,
+      invalidated: false,
+    };
+    this.promptQueues.set(session.sessionId, state);
+    return state;
+  }
+
+  private isCurrentPromptQueueState(state: AcpPromptQueueState): boolean {
+    return (
+      this.promptQueues.get(state.session.sessionId) === state &&
+      this.sessions.get(state.session.sessionId) === state.session &&
+      !state.invalidated
+    );
+  }
+
+  private invalidatePromptQueue(state: AcpPromptQueueState): void {
+    if (state.invalidated) return;
+    state.invalidated = true;
+    state.admissionClosed = true;
+    for (const entry of state.entries) {
+      entry.controller.abort(ACP_PROMPT_CANCEL_ABORT_REASON);
+      entry.params = undefined;
+      entry.invocationContext = undefined;
+      entry.modelPrompt = undefined;
+      entry.text = undefined;
+      this.settlePromptQueueEntry(entry, {
+        response: { stopReason: 'cancelled' },
+      });
+      entry.settleExecutor();
+    }
+    state.entries.length = 0;
+  }
+
+  private hasPromptQueueOwnership(sessionId: string): boolean {
+    return (this.promptQueues.get(sessionId)?.entries.length ?? 0) > 0;
+  }
+
+  private hasLiveQueuedPrompt(state: AcpPromptQueueState): boolean {
+    return state.entries.some((entry) => entry.state === 'queued');
+  }
+
+  private publishDirectPromptQueueEvent(
+    kind:
+      | typeof PENDING_PROMPT_ADDED_EVENT
+      | typeof PENDING_PROMPT_STARTED_EVENT
+      | typeof PENDING_PROMPT_COMPLETED_EVENT,
+    data: object,
+  ): void {
+    void this.connection
+      .extNotification(PROMPT_QUEUE_NOTIFICATION_METHOD, { kind, data })
+      .catch((error: unknown) => {
+        debugLogger.debug(
+          `ACP prompt queue notification ${kind} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+  }
+
+  private settlePromptQueueEntry(
+    entry: AcpPromptQueueEntry,
+    outcome: { response: PromptResponse } | { error: unknown },
+  ): void {
+    if (entry.callerSettled) return;
+    entry.callerSettled = true;
+    if ('response' in outcome) entry.resolve(outcome.response);
+    else entry.reject(outcome.error);
+  }
+
+  private retireDirectQueuedPrompt(
+    state: AcpPromptQueueState,
+    entry: AcpPromptQueueEntry,
+  ): void {
+    if (entry.state !== 'queued') return;
+    entry.state = 'removed';
+    entry.controller.abort(
+      new DOMException('Prompt removed before dispatch', 'AbortError'),
+    );
+    if (entry.wasQueued) {
+      this.publishDirectPromptQueueEvent(
+        PENDING_PROMPT_COMPLETED_EVENT,
+        buildPendingPromptCompletedData({
+          sessionId: state.session.sessionId,
+          promptId: entry.promptId,
+          ...(entry.clientPromptId !== undefined
+            ? { clientPromptId: entry.clientPromptId }
+            : {}),
+          state: 'removed',
+        }),
+      );
+    }
+    entry.params = undefined;
+    entry.invocationContext = undefined;
+    entry.modelPrompt = undefined;
+    entry.text = undefined;
+    this.settlePromptQueueEntry(entry, {
+      response: { stopReason: 'cancelled' },
+    });
+    if (!this.hasLiveQueuedPrompt(state)) {
+      const running = state.entries.find(
+        (candidate) => candidate.state === 'running',
+      );
+      if (running) {
+        state.session.releaseTodoStopGuardQueuedPromptWait(running.promptId);
+      }
+    }
+  }
+
+  private startPromptQueueDrain(state: AcpPromptQueueState): void {
+    if (state.draining || state.entries.length === 0) return;
+    const head = state.entries[0]!;
+    if (head.state === 'queued') head.state = 'running';
+    state.draining = true;
+    const completion = this.drainPromptQueue(state).finally(() => {
+      if (state.drainCompletion === completion) {
+        state.drainCompletion = undefined;
+      }
+    });
+    state.drainCompletion = completion;
+    void completion.catch((error: unknown) => {
+      debugLogger.error(
+        `ACP prompt queue drain failed for ${state.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+
+  private async drainPromptQueue(state: AcpPromptQueueState): Promise<void> {
+    try {
+      while (this.isCurrentPromptQueueState(state)) {
+        const entry = state.entries[0];
+        if (!entry) return;
+        if (entry.state === 'removed') {
+          state.entries.shift();
+          entry.settleExecutor();
+          continue;
+        }
+        if (entry.state === 'queued') entry.state = 'running';
+        if (entry.wasQueued) {
+          this.publishDirectPromptQueueEvent(
+            PENDING_PROMPT_STARTED_EVENT,
+            buildPendingPromptStartedData({
+              sessionId: state.session.sessionId,
+              promptId: entry.promptId,
+              ...(entry.clientPromptId !== undefined
+                ? { clientPromptId: entry.clientPromptId }
+                : {}),
+              text: entry.text ?? '',
+            }),
+          );
+        }
+        let outcome: { response: PromptResponse } | { error: unknown };
+        const call: ActivePromptCall = {
+          controller: entry.controller,
+          settled: entry.executorSettled,
+        };
+        let calls = this.activePromptCalls.get(state.session.sessionId);
+        if (!calls) {
+          calls = new Set();
+          this.activePromptCalls.set(state.session.sessionId, calls);
+        }
+        calls.add(call);
+        try {
+          const params = entry.params;
+          outcome = params
+            ? {
+                response: await state.session.prompt(
+                  params,
+                  entry.invocationContext,
+                  entry.controller.signal,
+                  entry.modelPrompt,
+                ),
+              }
+            : { response: { stopReason: 'cancelled' } };
+        } catch (error) {
+          outcome = { error };
+        } finally {
+          calls.delete(call);
+          if (calls.size === 0) {
+            this.activePromptCalls.delete(state.session.sessionId);
+          }
+        }
+        try {
+          await this.activeWorkReporter?.flush();
+        } catch (error) {
+          debugLogger.debug(
+            `ACP active-work flush failed after prompt ${entry.promptId}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (!this.isCurrentPromptQueueState(state)) return;
+        if (entry.wasQueued) {
+          this.publishDirectPromptQueueEvent(
+            PENDING_PROMPT_COMPLETED_EVENT,
+            buildPendingPromptCompletedData({
+              sessionId: state.session.sessionId,
+              promptId: entry.promptId,
+              ...(entry.clientPromptId !== undefined
+                ? { clientPromptId: entry.clientPromptId }
+                : {}),
+              state: 'completed',
+            }),
+          );
+        }
+        this.settlePromptQueueEntry(entry, outcome);
+        entry.settleExecutor();
+        entry.params = undefined;
+        entry.invocationContext = undefined;
+        entry.modelPrompt = undefined;
+        entry.text = undefined;
+        if (state.entries[0] === entry) state.entries.shift();
+      }
+    } finally {
+      state.draining = false;
+      if (this.isCurrentPromptQueueState(state) && state.entries.length > 0) {
+        this.startPromptQueueDrain(state);
+      }
+    }
+  }
+
+  private async cancelAllPromptEntries(
+    state: AcpPromptQueueState,
+  ): Promise<void> {
+    state.admissionClosed = true;
+    for (const entry of state.entries) {
+      if (entry.state === 'queued') {
+        this.retireDirectQueuedPrompt(state, entry);
+      } else if (entry.state === 'running') {
+        entry.controller.abort(ACP_PROMPT_CANCEL_ABORT_REASON);
+        this.settlePromptQueueEntry(entry, {
+          response: { stopReason: 'cancelled' },
+        });
+      }
+    }
+    try {
+      await state.session.cancelPendingPrompt();
+    } catch (error) {
+      if (!isNotCurrentlyGeneratingCancelError(error)) throw error;
+    }
+    await state.drainCompletion;
+  }
+
   isTrustedManagedParent(): boolean {
     return this.privateParentState === 'trusted';
   }
@@ -3922,6 +4218,23 @@ class QwenAgent implements Agent {
     }
   }
 
+  private beginLiveHistoryMutation(
+    sessionId: string,
+    session: Session,
+  ): () => void {
+    const queue = this.promptQueues.get(sessionId);
+    if (
+      !queue ||
+      queue.session !== session ||
+      queue.entries.length > 0 ||
+      queue.admissionClosed
+    ) {
+      throw new RequestError(-32602, 'Session is busy processing a turn', {
+        errorKind: 'session_busy',
+      });
+    }
+    return session.beginHistoryMutation();
+  }
   private rejectUnsupportedGuardedHiddenAgent(operation: string): void {
     if (
       this.managedToolInvocationGuard &&
@@ -4413,6 +4726,22 @@ class QwenAgent implements Agent {
       cleanupErrors.push(error);
     }
     this.sessions.delete(sessionId);
+    const queue = this.promptQueues.get(sessionId);
+    if (queue?.session === session) {
+      queue.admissionClosed = true;
+      this.promptQueues.delete(sessionId);
+      for (const entry of queue.entries) {
+        entry.params = undefined;
+        entry.invocationContext = undefined;
+        entry.modelPrompt = undefined;
+        entry.text = undefined;
+        this.settlePromptQueueEntry(entry, {
+          response: { stopReason: 'cancelled' },
+        });
+        entry.settleExecutor();
+      }
+      queue.entries.length = 0;
+    }
     // A Session missing from the next snapshot is how the daemon learns the
     // child released it — including when it never saw our close response.
     this.activeWorkReporter?.notifyChanged();
@@ -4559,46 +4888,60 @@ class QwenAgent implements Agent {
       return { closed: true, holds: [] };
     }
 
+    const queue = this.promptQueues.get(sessionId);
+    if (queue?.session === session) queue.admissionClosed = true;
     const recorder = session.getConfig().getChatRecordingService();
     const requireFlush = opts?.requireFlush === true;
-    if (requireFlush) await recorder?.flush();
     const drainTimeoutMs = opts?.drainTimeoutMs ?? SESSION_DRAIN_TIMEOUT_MS;
-    const cancelClose = opts?.waitForCloseGate
-      ? await beginSessionCloseAfterCurrentGate(session, drainTimeoutMs)
-      : session.beginClose();
-    // Reject known work before disturbing any active turn. The close gate
-    // prevents new turns, but a turn that was already running can still settle
-    // into a new hold while the drain below is in progress, so this early read
-    // is an optimization rather than the final authorization.
-    if (opts?.onlyIfUnheld) {
-      const holds = session.collectActiveWorkHolds();
-      if (holds.length > 0) {
-        cancelClose();
-        return { closed: false, holds };
-      }
-    }
-    for (const [requestId, generation] of this.generationControllers) {
-      if (generation.sessionId !== sessionId) continue;
-      generation.controller.abort();
-      this.generationControllers.delete(requestId);
-    }
+    let cancelClose: (() => void) | undefined;
     let removedFromStore = false;
     try {
+      if (requireFlush) await recorder?.flush();
+      cancelClose = opts?.waitForCloseGate
+        ? await beginSessionCloseAfterCurrentGate(session, drainTimeoutMs)
+        : session.beginClose();
+      // Reject known work before disturbing any active turn. The close gate
+      // prevents new turns, but a turn that was already running can still settle
+      // into a new hold while the drain below is in progress, so this early read
+      // is an optimization rather than the final authorization.
+      if (opts?.onlyIfUnheld) {
+        const holds = session.collectActiveWorkHolds();
+        if (holds.length > 0) {
+          return { closed: false, holds };
+        }
+      }
+      for (const [requestId, generation] of this.generationControllers) {
+        if (generation.sessionId !== sessionId) continue;
+        generation.controller.abort();
+        this.generationControllers.delete(requestId);
+      }
       await waitForSessionDrain(
         (async () => {
-          try {
-            await session.cancelPendingPrompt();
-          } catch (err) {
-            debugLogger.debug(
-              `Session ${sessionId} cancel during close failed: ${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
+          if (queue?.session === session) {
+            await this.cancelAllPromptEntries(queue);
+          } else {
+            try {
+              await session.cancelPendingPrompt();
+            } catch (err) {
+              debugLogger.debug(
+                `Session ${sessionId} cancel during close failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
           }
           await session.waitForActiveTurnsToSettle();
         })(),
         drainTimeoutMs,
         'close',
+        () => {
+          if (
+            queue?.session === session &&
+            this.promptQueues.get(sessionId) === queue
+          ) {
+            this.invalidatePromptQueue(queue);
+          }
+        },
       );
 
       const blockedByHolds = await this.runExclusiveHistoryMutation(
@@ -4659,7 +5002,16 @@ class QwenAgent implements Agent {
       );
       if (blockedByHolds) return blockedByHolds;
     } finally {
-      if (!removedFromStore) cancelClose();
+      if (!removedFromStore) {
+        cancelClose?.();
+        if (
+          this.promptQueues.get(sessionId) === queue &&
+          queue &&
+          !queue.invalidated
+        ) {
+          queue.admissionClosed = false;
+        }
+      }
     }
     return { closed: true, holds: [] };
   }
@@ -4884,7 +5236,10 @@ class QwenAgent implements Agent {
           http: true,
         },
         _meta: {
-          imageCapability: IMAGE_CAPABILITY,
+          ...addPromptQueueCapabilityToMeta(
+            { imageCapability: IMAGE_CAPABILITY },
+            DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION,
+          ),
         },
       },
     };
@@ -5838,10 +6193,29 @@ class QwenAgent implements Agent {
       throw new Error(`Session not found: ${sessionId}`);
     }
     const sanitizedParams = { ...params, sessionId };
-    const meta =
+    const queue = this.promptQueues.get(sessionId);
+    if (!queue || queue.session !== session || queue.admissionClosed) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Session is closing or unavailable for prompt admission',
+      );
+    }
+    const rawMeta =
       params._meta && typeof params._meta === 'object'
         ? { ...params._meta }
         : {};
+    let parsedQueueMetadata: ReturnType<
+      typeof parseAndStripPromptQueueMetadata
+    >;
+    try {
+      parsedQueueMetadata = parseAndStripPromptQueueMetadata(rawMeta);
+    } catch (error) {
+      if (error instanceof InvalidPromptQueueMetadataError) {
+        throw RequestError.invalidParams(undefined, error.message);
+      }
+      throw error;
+    }
+    const meta = parsedQueueMetadata.meta ?? {};
     const suppliedContext = meta[INVOCATION_CONTEXT_META_KEY];
     const suppliedModelPrompt = meta[DAEMON_MODEL_PROMPT_META_KEY];
     const suppliedPromptDisplayText = meta[DAEMON_PROMPT_DISPLAY_TEXT_META_KEY];
@@ -5918,40 +6292,95 @@ class QwenAgent implements Agent {
         'Invalid trusted ACP model prompt',
       );
     }
-    let settleCall = () => {};
-    const call: ActivePromptCall = {
-      controller: new AbortController(),
-      settled: new Promise<void>((resolve) => {
-        settleCall = resolve;
-      }),
-    };
-    let calls = this.activePromptCalls.get(sessionId);
-    if (!calls) {
-      calls = new Set();
-      this.activePromptCalls.set(sessionId, calls);
-    }
-    calls.add(call);
-    try {
-      return await session.prompt(
-        sanitizedParams,
-        invocationContext,
-        call.controller.signal,
-        modelPrompt,
+    const promptId = invocationContext?.promptId ?? randomUUID();
+    if (!isValidPromptQueueServerId(promptId)) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Invalid trusted prompt queue id',
       );
-    } finally {
-      calls.delete(call);
-      if (calls.size === 0) {
-        this.activePromptCalls.delete(sessionId);
-      }
-      settleCall();
-      // Order a fresh snapshot ahead of this response on the same stream. The
-      // daemon drops its own pending-prompt count the instant the response
-      // lands, so any hold this prompt left behind — a background agent it
-      // started, a background shell, or a terminal notification — has to
-      // already be on the wire or the daemon sees an idle Session for as long
-      // as the next report takes.
-      await this.activeWorkReporter?.flush();
     }
+    if (queue.entries.length >= DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION) {
+      throw new RequestError(
+        -32603,
+        `Prompt queue full for session "${sessionId}"`,
+        buildPromptQueueFullErrorData(
+          sessionId,
+          DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION,
+          queue.entries.length,
+        ),
+      );
+    }
+    if (queue.entries.some((entry) => entry.promptId === promptId)) {
+      throw RequestError.invalidParams(undefined, 'Duplicate promptId');
+    }
+    const clientPromptId = parsedQueueMetadata.clientPromptId;
+    if (
+      clientPromptId !== undefined &&
+      queue.entries.some((entry) => entry.clientPromptId === clientPromptId)
+    ) {
+      throw RequestError.invalidParams(undefined, 'Duplicate clientPromptId');
+    }
+    if (session.hasHistoryMutationOwner()) {
+      throw new RequestError(
+        -32602,
+        'Session history mutation is in progress',
+        {
+          errorKind: 'session_busy',
+        },
+      );
+    }
+    const effectiveInvocationContext: InvocationContextV1 =
+      invocationContext ?? {
+        version: 1,
+        sessionId,
+        promptId,
+      };
+    let resolve!: (response: PromptResponse) => void;
+    let reject!: (reason: unknown) => void;
+    let settleExecutor!: () => void;
+    const result = new Promise<PromptResponse>(
+      (resolveResult, rejectResult) => {
+        resolve = resolveResult;
+        reject = rejectResult;
+      },
+    );
+    const executorSettled = new Promise<void>((resolveExecutor) => {
+      settleExecutor = resolveExecutor;
+    });
+    const wasQueued = queue.draining || queue.entries.length > 0;
+    const queuedAt = Date.now();
+    const entry: AcpPromptQueueEntry = {
+      promptId,
+      ...(clientPromptId !== undefined ? { clientPromptId } : {}),
+      params: sanitizedParams,
+      invocationContext: effectiveInvocationContext,
+      ...(modelPrompt !== undefined ? { modelPrompt } : {}),
+      text: extractDirectPromptText(params.prompt),
+      queuedAt,
+      state: wasQueued ? 'queued' : 'running',
+      wasQueued,
+      callerSettled: false,
+      controller: new AbortController(),
+      executorSettled,
+      settleExecutor,
+      resolve,
+      reject,
+    };
+    queue.entries.push(entry);
+    if (wasQueued) {
+      this.publishDirectPromptQueueEvent(
+        PENDING_PROMPT_ADDED_EVENT,
+        buildPendingPromptAddedData({
+          sessionId,
+          promptId,
+          ...(clientPromptId !== undefined ? { clientPromptId } : {}),
+          text: entry.text ?? '',
+          queuedAt,
+        }),
+      );
+    }
+    this.startPromptQueueDrain(queue);
+    return result;
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -5960,19 +6389,16 @@ class QwenAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
+    const running = this.promptQueues
+      .get(sessionId)
+      ?.entries.find((entry) => entry.state === 'running');
+    running?.controller.abort(ACP_PROMPT_CANCEL_ABORT_REASON);
     try {
       await session.cancelPendingPrompt();
     } catch (error) {
       if (!isNotCurrentlyGeneratingCancelError(error)) {
         throw error;
       }
-    }
-    // Prompt calls still waiting at Session admission are tracked in
-    // activePromptCalls but have no session pendingPrompt yet, so
-    // cancelPendingPrompt cannot see them. Abort their controllers too, or a
-    // cancelled prompt would run in full once admission frees.
-    for (const call of this.activePromptCalls.get(sessionId) ?? []) {
-      call.controller.abort();
     }
   }
 
@@ -8283,6 +8709,69 @@ class QwenAgent implements Agent {
     const SESSION_ID_RE = /^[0-9a-fA-F-]{32,36}$/;
 
     switch (method) {
+      case PROMPT_QUEUE_LIST_METHOD: {
+        const sessionId = params['sessionId'];
+        if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid or missing sessionId',
+          );
+        }
+        const session = this.sessions.get(sessionId);
+        const queue = this.promptQueues.get(sessionId);
+        if (!session || !queue || queue.session !== session) {
+          throw RequestError.invalidParams(
+            undefined,
+            `Session not found for id: ${sessionId}`,
+          );
+        }
+        return {
+          version: PROMPT_QUEUE_PROTOCOL_VERSION,
+          pendingPrompts: queue.entries
+            .filter((entry) => entry.state !== 'removed')
+            .map((entry) => ({
+              promptId: entry.promptId,
+              ...(entry.clientPromptId !== undefined
+                ? { clientPromptId: entry.clientPromptId }
+                : {}),
+              text: entry.text ?? '',
+              queuedAt: entry.queuedAt,
+              state: entry.state,
+            })),
+        };
+      }
+      case PROMPT_QUEUE_REMOVE_METHOD: {
+        const sessionId = params['sessionId'];
+        const promptId = params['promptId'];
+        if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid or missing sessionId',
+          );
+        }
+        if (!isValidPromptQueueServerId(promptId)) {
+          throw RequestError.invalidParams(undefined, 'Invalid promptId');
+        }
+        const session = this.sessions.get(sessionId);
+        const queue = this.promptQueues.get(sessionId);
+        if (!session || !queue || queue.session !== session) {
+          throw RequestError.invalidParams(
+            undefined,
+            `Session not found for id: ${sessionId}`,
+          );
+        }
+        const entry = queue.entries.find(
+          (candidate) => candidate.promptId === promptId,
+        );
+        if (!entry || entry.state === 'removed') {
+          return { removed: false, reason: 'not_found' };
+        }
+        if (entry.state === 'running') {
+          return { removed: false, reason: 'already_started' };
+        }
+        this.retireDirectQueuedPrompt(queue, entry);
+        return { removed: true };
+      }
       case PROMPT_CANCEL_METHOD: {
         const sessionId = params['sessionId'];
         if (typeof sessionId !== 'string' || sessionId.length === 0) {
@@ -8298,14 +8787,19 @@ class QwenAgent implements Agent {
             `Session not found for id: ${sessionId}`,
           );
         }
-        const targetedCalls = new Set(
-          this.activePromptCalls.get(sessionId) ?? [],
-        );
-        if (targetedCalls.size === 0) {
+        const running = this.promptQueues
+          .get(sessionId)
+          ?.entries.find((entry) => entry.state === 'running');
+        if (!running) {
           return { cancelled: false };
         }
-        targetedCalls.forEach((call) => call.controller.abort());
-        await Promise.all(Array.from(targetedCalls, (call) => call.settled));
+        running.controller.abort(ACP_PROMPT_CANCEL_ABORT_REASON);
+        try {
+          await session.cancelPendingPrompt();
+        } catch (error) {
+          if (!isNotCurrentlyGeneratingCancelError(error)) throw error;
+        }
+        await running.executorSettled;
         return { cancelled: true };
       }
       case TODO_STOP_GUARD_QUEUE_RELEASE_METHOD: {
@@ -8679,7 +9173,7 @@ class QwenAgent implements Agent {
             }
             const reader = new SessionTranscriptReader(cwd);
             const activePromptBeforeRead =
-              this.activePromptCalls.has(sessionId);
+              this.hasPromptQueueOwnership(sessionId);
             const page = await reader.readPage(sessionId, {
               ...(typeof rawCursor === 'string' ? { cursor: rawCursor } : {}),
               ...(typeof rawBeforeRecordId === 'string'
@@ -8698,7 +9192,7 @@ class QwenAgent implements Agent {
               config,
               finalizeDangling:
                 !activePromptBeforeRead &&
-                !this.activePromptCalls.has(sessionId),
+                !this.hasPromptQueueOwnership(sessionId),
               encodeCursor: (state) =>
                 encodeSessionTranscriptCursor(state, cwd),
               logger: debugLogger,
@@ -11296,12 +11790,12 @@ class QwenAgent implements Agent {
           (turnIndex === undefined || turnIndex === null);
         if (resolveFromPromptId) {
           const prefix = sessionId + '########';
-          if (!promptId.startsWith(prefix)) {
+          if (!(promptId as string).startsWith(prefix)) {
             throw new RequestError(-32602, 'Invalid promptId format', {
               errorKind: 'invalid_rewind_target',
             });
           }
-          const suffix = promptId.slice(prefix.length);
+          const suffix = (promptId as string).slice(prefix.length);
           if (!/^\d+$/.test(suffix)) {
             throw new RequestError(
               -32602,
@@ -11316,57 +11810,64 @@ class QwenAgent implements Agent {
           );
         }
 
-        return await this.runExclusiveHistoryMutation(sessionId, async () => {
-          if (resolveFromPromptId) {
-            // Derive turnIndex from the snapshot's position in the array,
-            // NOT from the promptId suffix. Session.turn is monotonic and
-            // does not reset on rewind, so after a rewind cycle the suffix
-            // no longer matches the turn's position in the current history.
-            const fhs = session.getConfig().getFileHistoryService();
-            const snapshots = fhs.getSnapshots();
-            const snapshotIdx = snapshots.findIndex(
-              (s) => s.promptId === promptId,
-            );
-            if (snapshotIdx < 0) {
-              throw new RequestError(
-                -32602,
-                'Snapshot not found for the given promptId',
-                { errorKind: 'invalid_rewind_target' },
+        const releaseHistoryMutation = this.beginLiveHistoryMutation(
+          sessionId,
+          session,
+        );
+        try {
+          return await this.runExclusiveHistoryMutation(sessionId, async () => {
+            if (resolveFromPromptId) {
+              // Derive turnIndex from the snapshot's position in the array,
+              // NOT from the promptId suffix. Session.turn is monotonic and
+              // does not reset on rewind, so after a rewind cycle the suffix
+              // no longer matches the turn's position in the current history.
+              const fhs = session.getConfig().getFileHistoryService();
+              const snapshots = fhs.getSnapshots();
+              const snapshotIdx = snapshots.findIndex(
+                (s) => s.promptId === promptId,
               );
-            }
-            turnIndex = snapshotIdx;
-          }
-
-          const rewindFiles = params['rewindFiles'] !== false;
-          const historyBeforeRewind = session.captureHistorySnapshot();
-          let rewindResult;
-          let releaseHistoryMutation: () => void;
-          try {
-            rewindResult = session.rewindToTurn(turnIndex as number, {
-              rewindFiles,
-            });
-            releaseHistoryMutation = session.beginHistoryMutation();
-          } catch (err) {
-            if (err instanceof RequestError) {
-              const msg = err.message;
-              if (
-                msg.includes('Cannot rewind while a prompt is running') ||
-                msg.includes('Session is busy processing a turn')
-              ) {
-                throw new RequestError(err.code, msg, {
-                  errorKind: 'session_busy',
-                });
+              if (snapshotIdx < 0) {
+                throw new RequestError(
+                  -32602,
+                  'Snapshot not found for the given promptId',
+                  { errorKind: 'invalid_rewind_target' },
+                );
               }
-              if (msg.includes('compressed or does not exist')) {
-                throw new RequestError(err.code, msg, {
-                  errorKind: 'invalid_rewind_target',
-                });
-              }
+              turnIndex = snapshotIdx;
             }
-            throw err;
-          }
 
-          try {
+            const rewindFiles = params['rewindFiles'] !== false;
+            const historyBeforeRewind =
+              session.captureHistorySnapshotForMutation(releaseHistoryMutation);
+            let rewindResult;
+            try {
+              rewindResult = session.rewindToTurn(
+                turnIndex as number,
+                {
+                  rewindFiles,
+                },
+                releaseHistoryMutation,
+              );
+            } catch (err) {
+              if (err instanceof RequestError) {
+                const msg = err.message;
+                if (
+                  msg.includes('Cannot rewind while a prompt is running') ||
+                  msg.includes('Session is busy processing a turn')
+                ) {
+                  throw new RequestError(err.code, msg, {
+                    errorKind: 'session_busy',
+                  });
+                }
+                if (msg.includes('compressed or does not exist')) {
+                  throw new RequestError(err.code, msg, {
+                    errorKind: 'invalid_rewind_target',
+                  });
+                }
+              }
+              throw err;
+            }
+
             let filesChanged: string[] = [];
             let filesFailed: string[] = [];
             if (rewindFiles && promptId) {
@@ -11432,10 +11933,10 @@ class QwenAgent implements Agent {
                 ? { artifactSnapshotUnavailable }
                 : {}),
             };
-          } finally {
-            releaseHistoryMutation();
-          }
-        });
+          });
+        } finally {
+          releaseHistoryMutation();
+        }
       }
       case 'qwen/session/loadUpdates': {
         const sessionId = params['sessionId'] as string;
@@ -11521,8 +12022,16 @@ class QwenAgent implements Agent {
           );
         }
 
-        session.restoreHistory(history as Content[]);
-        return { success: true };
+        const releaseHistoryMutation = this.beginLiveHistoryMutation(
+          sessionId,
+          session,
+        );
+        try {
+          session.restoreHistory(history as Content[], releaseHistoryMutation);
+          return { success: true };
+        } finally {
+          releaseHistoryMutation();
+        }
       }
       case 'getAccountInfo': {
         const sessionId = params['sessionId'] as string | undefined;
@@ -11566,84 +12075,59 @@ class QwenAgent implements Agent {
           });
         }
 
-        if (!isSideTask) {
-          if (!sourceSession.isTurnIdle()) {
-            throw new RequestError(
-              -32602,
-              'Cannot branch while a prompt is running',
-              { errorKind: 'session_busy' },
-            );
-          }
-          try {
-            return await this.runExclusiveHistoryMutation(
-              sessionId,
-              async () => {
-                await sourceSession.assertCanStartTurn();
-                const releaseHistoryMutation =
-                  sourceSession.beginHistoryMutation();
-                try {
-                  const sourceConfig = sourceSession.getConfig();
-                  const recording = sourceConfig.getChatRecordingService();
-                  const sessionService = sourceConfig.getSessionService();
-
-                  const baseName = deriveForkBaseName(
-                    name,
-                    recording,
-                    sessionId,
-                  );
-
-                  const title = await computeUniqueBranchTitle(
-                    baseName,
-                    sessionService,
-                  );
-                  const newSessionId = randomUUID();
-                  const fork = () =>
-                    sessionService.forkSession(sessionId, newSessionId, {
-                      title,
-                      ...(atRecordId !== undefined ? { atRecordId } : {}),
-                    });
-                  if (recording) {
-                    await recording.runWithWriteBarrier(fork);
-                  } else {
-                    await fork();
-                  }
-                  return { newSessionId, title, displayName: title };
-                } finally {
-                  releaseHistoryMutation();
-                }
-              },
-            );
-          } catch (error) {
-            if (error instanceof BranchPointInvalidError) {
-              throw new RequestError(-32009, error.message, {
-                errorKind: 'branch_point_invalid',
-                recordId: error.recordId,
-              });
+        if (!sourceSession.isTurnIdle()) {
+          throw new RequestError(
+            -32602,
+            'Cannot branch while a prompt is running',
+            { errorKind: 'session_busy' },
+          );
+        }
+        const releaseHistoryMutation = this.beginLiveHistoryMutation(
+          sessionId,
+          sourceSession,
+        );
+        try {
+          return await this.runExclusiveHistoryMutation(sessionId, async () => {
+            await sourceSession.assertCanStartTurn(releaseHistoryMutation);
+            const sourceConfig = sourceSession.getConfig();
+            const recording = sourceConfig.getChatRecordingService();
+            const sessionService = sourceConfig.getSessionService();
+            const baseName = deriveForkBaseName(name, recording, sessionId);
+            const title = isSideTask
+              ? baseName
+              : await computeUniqueBranchTitle(baseName, sessionService);
+            const newSessionId = randomUUID();
+            const fork = () =>
+              isSideTask
+                ? sessionService.forkSession(sessionId, newSessionId, {
+                    source: {
+                      sourceType: 'side_task',
+                      sourceId: sessionId,
+                    },
+                    title,
+                  })
+                : sessionService.forkSession(sessionId, newSessionId, {
+                    title,
+                    ...(atRecordId !== undefined ? { atRecordId } : {}),
+                  });
+            if (recording) {
+              await recording.runWithWriteBarrier(fork);
+            } else {
+              await fork();
             }
-            throw error;
-          }
-        }
-
-        const sourceConfig = sourceSession.getConfig();
-        const recording = sourceConfig.getChatRecordingService();
-        if (recording) await recording.flush();
-        const sessionService = sourceConfig.getSessionService();
-        const title = deriveForkBaseName(name, recording, sessionId);
-        const newSessionId = randomUUID();
-        const fork = () =>
-          sessionService.forkSession(sessionId, newSessionId, {
-            source: {
-              sourceType: 'side_task',
-              sourceId: sessionId,
-            },
-            title,
+            return { newSessionId, title, displayName: title };
           });
-        if (recording) {
-          await recording.runWithWriteBarrier(fork);
-        } else {
-          await fork();
+        } catch (error) {
+          if (error instanceof BranchPointInvalidError) {
+            throw new RequestError(-32009, error.message, {
+              errorKind: 'branch_point_invalid',
+              recordId: error.recordId,
+            });
+          }
+          throw error;
+        } finally {
+          releaseHistoryMutation();
         }
-        return { newSessionId, title, displayName: title };
       }
       case 'qwen/settings/getCore': {
         const settings = loadSettings(cwd);
@@ -12668,18 +13152,30 @@ class QwenAgent implements Agent {
     }
     options.beforeSessionCreate?.();
 
-    const session = new Session(
+    const session: Session = new Session(
       sessionId,
       config,
       this.connection,
       settings,
       (operation) => this.runExclusiveHistoryMutation(sessionId, operation),
       () => this.activeWorkReporter?.notifyChanged(),
+      {
+        inspectRemoteQueue: this.privateParentState === 'trusted',
+        hasQueuedPrompt: (): boolean => {
+          const queue = this.promptQueues.get(sessionId);
+          return (
+            queue !== undefined &&
+            queue.session === session &&
+            this.hasLiveQueuedPrompt(queue)
+          );
+        },
+      },
     );
     let published = false;
     try {
       options.primeSession?.(session);
       config.hydrateSessionRestoreFileHistory?.();
+      this.createPromptQueueState(session);
       this.sessions.set(sessionId, session);
       published = true;
       // The Session set itself is part of the snapshot: publish so the daemon

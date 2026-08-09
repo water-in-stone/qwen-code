@@ -18,6 +18,10 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { NOT_CURRENTLY_GENERATING_CANCEL_MESSAGE } from '@qwen-code/acp-bridge/bridgeErrors';
+import {
+  PROMPT_QUEUE_LIST_METHOD,
+  PROMPT_QUEUE_REMOVE_METHOD,
+} from '@qwen-code/acp-bridge/promptQueueProtocol';
 import { ACP_EVENT_LOOP_STALL_RESTART_MS } from '@qwen-code/channel-base';
 
 // Mock cleanup module before importing anything else
@@ -1982,10 +1986,12 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
   let lastSessionMock:
     | {
         captureHistorySnapshot: ReturnType<typeof vi.fn>;
+        captureHistorySnapshotForMutation: ReturnType<typeof vi.fn>;
         emitGoalStatus: ReturnType<typeof vi.fn>;
         restoreHistory: ReturnType<typeof vi.fn>;
         rewindToTurn: ReturnType<typeof vi.fn>;
         beginHistoryMutation: ReturnType<typeof vi.fn>;
+        hasHistoryMutationOwner: ReturnType<typeof vi.fn>;
         getRewindableUserTurnCount: ReturnType<typeof vi.fn>;
         clearActiveTodoPlanRevision: ReturnType<typeof vi.fn>;
         clearTodoStopGuardTrust: ReturnType<typeof vi.fn>;
@@ -2107,6 +2113,18 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           http: true,
         },
         _meta: {
+          qwen: {
+            methods: expect.arrayContaining([
+              '_qwen/session/prompt_queue/list',
+              '_qwen/session/prompt_queue/remove',
+            ]),
+            promptQueue: {
+              version: 1,
+              delivery: 'next_turn',
+              maxPendingPromptsPerSession: 5,
+              sessionCancelScope: 'running_only',
+            },
+          },
           imageCapability: {
             autoHandlesWrongModel: true,
             maxBytes: 10380902,
@@ -2188,7 +2206,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     const invocation = {
       version: 1,
       sessionId: 'trusted-session',
-      promptId: 'trusted-prompt',
+      promptId: '550e8400-e29b-41d4-a716-446655440000',
       originatorClientId: 'trusted-client',
     };
 
@@ -2546,7 +2564,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           'qwen-code/invocation': {
             version: 2,
             sessionId: 'trusted-session',
-            promptId: 'trusted-prompt',
+            promptId: '550e8400-e29b-41d4-a716-446655440000',
           },
         },
       }),
@@ -2587,7 +2605,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           'qwen-code/invocation': {
             version: 1,
             sessionId: 'trusted-session',
-            promptId: 'trusted-prompt',
+            promptId: '550e8400-e29b-41d4-a716-446655440000',
           },
           'qwen.daemon.modelPrompt': { forged: true },
         },
@@ -2637,7 +2655,13 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         prompt: [{ type: 'text', text: 'hello' }],
         _meta: { keep: true },
       },
-      undefined,
+      {
+        version: 1,
+        sessionId: 'untrusted-session',
+        promptId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        ),
+      },
       expect.any(AbortSignal),
       undefined,
     );
@@ -3958,11 +3982,15 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         captureHistorySnapshot: vi
           .fn()
           .mockReturnValue([{ role: 'user', parts: [{ text: 'before' }] }]),
+        captureHistorySnapshotForMutation: vi
+          .fn()
+          .mockReturnValue([{ role: 'user', parts: [{ text: 'before' }] }]),
         restoreHistory: vi.fn(),
         rewindToTurn: vi
           .fn()
           .mockReturnValue({ targetTurnIndex: 1, apiTruncateIndex: 2 }),
         beginHistoryMutation: vi.fn().mockImplementation(() => vi.fn()),
+        hasHistoryMutationOwner: vi.fn().mockReturnValue(false),
         getRewindableUserTurnCount: vi.fn().mockReturnValue(1),
         clearActiveTodoPlanRevision: vi.fn(),
         clearTodoStopGuardTrust: vi.fn(),
@@ -3989,6 +4017,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       get closed() {
         return mockConnectionState.promise;
       },
+      extNotification: vi.fn().mockResolvedValue(undefined),
     }) as AgentLike;
     return { agent, agentPromise };
   }
@@ -4264,7 +4293,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       });
     await vi.waitFor(() => expect(cancellationSignal?.aborted).toBe(true));
     expect(cancellationSettled).toBe(false);
-    expect(lastSessionMock?.cancelPendingPrompt).not.toHaveBeenCalled();
+    expect(lastSessionMock?.cancelPendingPrompt).toHaveBeenCalledOnce();
 
     finishPrompt?.({ stopReason: 'cancelled' });
     await expect(cancellation).resolves.toEqual({ cancelled: true });
@@ -4306,9 +4335,9 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         _invocationContext: unknown,
         signal?: AbortSignal,
       ) => {
-        // The prompt waits at writer admission inside Session.prompt: tracked
-        // in activePromptCalls, but no session pendingPrompt exists yet, so
-        // cancelPendingPrompt cannot reach it.
+        // The queue head waits at writer admission inside Session.prompt.
+        // Its admission signal remains independently cancellable before the
+        // Session installs its execution-local pendingPrompt controller.
         await admissionGate;
         return { stopReason: signal?.aborted ? 'cancelled' : 'end_turn' };
       },
@@ -4330,7 +4359,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     await agentPromise;
   });
 
-  it('does not serialize overlapping prompts behind the history-mutation gate', async () => {
+  it('FIFO-serializes overlapping prompts without aborting the running turn', async () => {
     const sessionId = '11111111-1111-1111-1111-111111111111';
     await setupSessionMocks(sessionId);
     const { agent, agentPromise } = await bootAcpAgent();
@@ -4358,19 +4387,169 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
     );
     const second = agent.prompt({ sessionId, prompt: [] });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1);
+    releaseFirstPrompt();
+
+    await expect(first).resolves.toEqual({ stopReason: 'end_turn' });
     await vi.waitFor(() =>
       expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(2),
     );
     await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
-    releaseFirstPrompt();
-
-    await expect(first).resolves.toEqual({ stopReason: 'end_turn' });
     expect(abortedAtEntry).toEqual([false, false]);
 
     mockConnectionState.resolve();
     await agentPromise;
   });
 
+  it('keeps queued prompts admitted when the running prompt is cancelled', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootAcpAgent();
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    lastSessionMock?.prompt
+      .mockImplementationOnce(
+        async (
+          _params: unknown,
+          _invocationContext: unknown,
+          signal?: AbortSignal,
+        ) =>
+          new Promise<{ stopReason: 'cancelled' }>((resolve) => {
+            const finish = () => resolve({ stopReason: 'cancelled' });
+            if (signal?.aborted) finish();
+            else signal?.addEventListener('abort', finish, { once: true });
+          }),
+      )
+      .mockResolvedValueOnce({ stopReason: 'end_turn' });
+
+    const first = agent.prompt({ sessionId, prompt: [] });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
+    );
+    const second = agent.prompt({ sessionId, prompt: [] });
+    await agent.cancel({ sessionId });
+
+    await expect(first).resolves.toEqual({ stopReason: 'cancelled' });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(2),
+    );
+    await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
+    expect(lastSessionMock?.cancelPendingPrompt).toHaveBeenCalledOnce();
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('rejects the sixth admitted direct prompt with stable queue-full data', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootAcpAgent();
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    let releaseFirstPrompt!: () => void;
+    const firstPromptGate = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve;
+    });
+    lastSessionMock?.prompt
+      .mockImplementationOnce(async () => {
+        await firstPromptGate;
+        return { stopReason: 'end_turn' };
+      })
+      .mockResolvedValue({ stopReason: 'end_turn' });
+
+    const admitted = [agent.prompt({ sessionId, prompt: [] })];
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
+    );
+    for (let i = 1; i < 5; i += 1) {
+      admitted.push(agent.prompt({ sessionId, prompt: [] }));
+    }
+
+    await expect(agent.prompt({ sessionId, prompt: [] })).rejects.toMatchObject(
+      {
+        code: -32603,
+        data: {
+          errorKind: 'prompt_queue_full',
+          sessionId,
+          limit: 5,
+          pendingCount: 5,
+          retryable: true,
+        },
+      },
+    );
+
+    releaseFirstPrompt();
+    await expect(Promise.all(admitted)).resolves.toEqual(
+      Array.from({ length: 5 }, () => ({ stopReason: 'end_turn' })),
+    );
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('lists and removes a queued prompt without dispatching it', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootAcpAgent();
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    let releaseFirstPrompt!: () => void;
+    const firstPromptGate = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve;
+    });
+    lastSessionMock?.prompt
+      .mockImplementationOnce(async () => {
+        await firstPromptGate;
+        return { stopReason: 'end_turn' };
+      })
+      .mockResolvedValue({ stopReason: 'end_turn' });
+
+    const first = agent.prompt({ sessionId, prompt: [] });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
+    );
+    const second = agent.prompt({
+      sessionId,
+      prompt: [{ type: 'text', text: 'queued' }],
+      _meta: {
+        qwen: { promptQueue: { clientPromptId: 'client-prompt-2' } },
+      },
+    });
+
+    const listed = await agent.extMethod(PROMPT_QUEUE_LIST_METHOD, {
+      sessionId,
+    });
+    expect(listed).toMatchObject({
+      version: 1,
+      pendingPrompts: [
+        { state: 'running' },
+        {
+          state: 'queued',
+          text: 'queued',
+          clientPromptId: 'client-prompt-2',
+        },
+      ],
+    });
+    const queuedPromptId = (
+      listed['pendingPrompts'] as Array<{ promptId: string }>
+    )[1]!.promptId;
+    await expect(
+      agent.extMethod(PROMPT_QUEUE_REMOVE_METHOD, {
+        sessionId,
+        promptId: queuedPromptId,
+      }),
+    ).resolves.toEqual({ removed: true });
+    await expect(second).resolves.toEqual({ stopReason: 'cancelled' });
+    expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1);
+
+    releaseFirstPrompt();
+    await expect(first).resolves.toEqual({ stopReason: 'end_turn' });
+    expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1);
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
   it('reconnects an MCP server in every live non-pooled runtime', async () => {
     const server = { command: 'node', args: ['server.js'] };
     const workspaceDiscover = vi.fn().mockResolvedValue(undefined);
@@ -13218,9 +13397,11 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     releaseFlush();
     const response = await rewind;
 
-    expect(lastSessionMock?.rewindToTurn).toHaveBeenCalledWith(1, {
-      rewindFiles: true,
-    });
+    expect(lastSessionMock?.rewindToTurn).toHaveBeenCalledWith(
+      1,
+      { rewindFiles: true },
+      expect.any(Function),
+    );
     expect(lastSessionMock?.beginHistoryMutation).toHaveBeenCalledOnce();
     expect(releaseHistoryMutation).toHaveBeenCalledOnce();
     expect(SessionService).toHaveBeenCalledWith('/tmp');
@@ -13392,9 +13573,11 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       cwd: '/tmp',
     });
 
-    expect(lastSessionMock?.rewindToTurn).toHaveBeenCalledWith(1, {
-      rewindFiles: false,
-    });
+    expect(lastSessionMock?.rewindToTurn).toHaveBeenCalledWith(
+      1,
+      { rewindFiles: false },
+      expect.any(Function),
+    );
 
     mockConnectionState.resolve();
     await agentPromise;
@@ -13672,7 +13855,10 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       cwd: '/tmp',
     });
 
-    expect(lastSessionMock?.restoreHistory).toHaveBeenCalledWith(history);
+    expect(lastSessionMock?.restoreHistory).toHaveBeenCalledWith(
+      history,
+      expect.any(Function),
+    );
     expect(response).toEqual({ success: true });
 
     mockConnectionState.resolve();
@@ -14352,6 +14538,7 @@ describe('QwenAgent extMethod renameSession routing', () => {
     vi.mocked(Session).mockImplementation(
       () =>
         ({
+          sessionId: liveSessionId,
           getId: vi.fn().mockReturnValue(liveSessionId),
           getConfig: vi.fn().mockReturnValue(innerConfig),
           cancelPendingPrompt: liveCancelPendingPrompt,
@@ -14781,10 +14968,11 @@ describe('QwenAgent extMethod renameSession routing', () => {
     ).rejects.toThrow('Session is closing');
     expect(liveAssertCanStartTurn).toHaveBeenCalledOnce();
     expect(sessionService.forkSession).not.toHaveBeenCalled();
-    // Ordering invariant: beginHistoryMutation must run only AFTER a passing
-    // assertCanStartTurn, so a failing assert never leaves the busy latch set
-    // with no wired release.
-    expect(liveBeginHistoryMutation).not.toHaveBeenCalled();
+    expect(liveAssertCanStartTurn).toHaveBeenCalledWith(
+      liveReleaseHistoryMutation,
+    );
+    expect(liveBeginHistoryMutation).toHaveBeenCalledOnce();
+    expect(liveReleaseHistoryMutation).toHaveBeenCalledOnce();
 
     mockConnectionState.resolve();
     await agentPromise;
@@ -14858,7 +15046,6 @@ describe('QwenAgent extMethod renameSession routing', () => {
     mockConnectionState.resolve();
     await agentPromise;
   });
-
   it('branches through its pinned SessionService while only non-turn work remains', async () => {
     const recording = makeRecordingService();
     const sessionService = {
@@ -15320,6 +15507,13 @@ describe('QwenAgent extMethod renameSession routing', () => {
         drainTimeoutMs: 5,
       }),
     ).rejects.toThrow('Session close timed out');
+    await expect(
+      (
+        agent as unknown as {
+          prompt(params: { sessionId: string; prompt: [] }): Promise<unknown>;
+        }
+      ).prompt({ sessionId: liveSessionId, prompt: [] }),
+    ).rejects.toThrow('Session is closing or unavailable');
     expect(recording.close).not.toHaveBeenCalled();
     expect(liveReleaseCloseGate).toHaveBeenCalledOnce();
     expect(

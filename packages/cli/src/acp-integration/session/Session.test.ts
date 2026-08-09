@@ -199,6 +199,18 @@ function chatRecord(overrides: Record<string, unknown>): ChatRecord {
   } as ChatRecord;
 }
 
+function withHistoryMutation<T>(
+  session: Session,
+  run: (owner: () => void) => T,
+): T {
+  const owner = session.beginHistoryMutation();
+  try {
+    return run(owner);
+  } finally {
+    owner();
+  }
+}
+
 describe('computeInitialTurnFromHistory', () => {
   it('uses the largest numeric prompt id suffix for the current session', () => {
     expect(
@@ -2383,7 +2395,7 @@ describe('Session', () => {
     expect(session.isTurnIdle()).toBe(true);
   });
 
-  it('rejects a prompt when a history mutation begins during writer admission', async () => {
+  it('rejects a history mutation while a prompt owns writer admission', async () => {
     let resolveAdmission!: () => void;
     const admission = new Promise<void>((resolve) => {
       resolveAdmission = resolve;
@@ -2404,14 +2416,14 @@ describe('Session', () => {
       prompt: [{ type: 'text', text: 'must not race the branch' }],
     });
     await admissionStarted;
-    const releaseMutation = session.beginHistoryMutation();
+    expect(() => session.beginHistoryMutation()).toThrow(
+      'Session is busy processing a turn',
+    );
     resolveAdmission();
 
-    await expect(prompt).rejects.toMatchObject({ code: -32602 });
-    expect(mockChat.sendMessageStream).not.toHaveBeenCalled();
-    releaseMutation();
+    await expect(prompt).resolves.toBeDefined();
+    expect(mockChat.sendMessageStream).toHaveBeenCalledOnce();
   });
-
   it('does not reopen a disposed session when a close gate releases late', async () => {
     const releaseClose = session.beginClose();
     const closeGateCompletion = session.waitForCloseGateToRelease();
@@ -2953,7 +2965,9 @@ describe('Session', () => {
         },
       });
 
-      const result = session.rewindToTurn(1);
+      const result = withHistoryMutation(session, (owner) =>
+        session.rewindToTurn(1, undefined, owner),
+      );
 
       expect(result).toEqual({ targetTurnIndex: 1, apiTruncateIndex: 2 });
       expect(mockChat.truncateHistory).toHaveBeenCalledWith(2);
@@ -2988,7 +3002,9 @@ describe('Session', () => {
         },
       ]);
 
-      const result = session.rewindToTurn(1, { rewindFiles: false });
+      const result = withHistoryMutation(session, (owner) =>
+        session.rewindToTurn(1, { rewindFiles: false }, owner),
+      );
 
       expect(result).toEqual({ targetTurnIndex: 1, apiTruncateIndex: 2 });
       expect(mockChat.truncateHistory).toHaveBeenCalledWith(2);
@@ -3018,7 +3034,9 @@ describe('Session', () => {
       vi.mocked(mockChat.getHistory).mockReturnValue(history);
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
 
-      const result = session.rewindToTurn(0);
+      const result = withHistoryMutation(session, (owner) =>
+        session.rewindToTurn(0, undefined, owner),
+      );
 
       expect(result).toEqual({ targetTurnIndex: 0, apiTruncateIndex: 1 });
       expect(mockChat.truncateHistory).toHaveBeenCalledWith(1);
@@ -3080,7 +3098,9 @@ describe('Session', () => {
       vi.mocked(mockChat.getHistory).mockReturnValue(history);
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
 
-      const result = session.rewindToTurn(1);
+      const result = withHistoryMutation(session, (owner) =>
+        session.rewindToTurn(1, undefined, owner),
+      );
 
       // Keep startup + turn 1 + the MCP reminder (indices 0–3); truncate at
       // the second prompt (index 4). Counting the reminder would return 3.
@@ -3112,7 +3132,11 @@ describe('Session', () => {
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
 
       expect(session.getRewindableUserTurnCount()).toBe(2);
-      expect(session.rewindToTurn(1)).toEqual({
+      expect(
+        withHistoryMutation(session, (owner) =>
+          session.rewindToTurn(1, undefined, owner),
+        ),
+      ).toEqual({
         targetTurnIndex: 1,
         apiTruncateIndex: 6,
       });
@@ -3140,9 +3164,11 @@ describe('Session', () => {
       vi.mocked(mockChat.getHistory).mockReturnValue(history);
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
 
-      expect(() => session.rewindToTurn(2)).toThrow(
-        'Cannot rewind to the requested turn',
-      );
+      expect(() =>
+        withHistoryMutation(session, (owner) =>
+          session.rewindToTurn(2, undefined, owner),
+        ),
+      ).toThrow('Cannot rewind to the requested turn');
       expect(mockChat.truncateHistory).not.toHaveBeenCalled();
     });
 
@@ -3242,7 +3268,9 @@ describe('Session', () => {
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
 
       const snapshot = session.captureHistorySnapshot();
-      session.restoreHistory(snapshot);
+      withHistoryMutation(session, (owner) =>
+        session.restoreHistory(snapshot, owner),
+      );
 
       expect(snapshot).toEqual(history);
       expect(mockChat.setHistory).toHaveBeenCalledWith(history);
@@ -3265,7 +3293,9 @@ describe('Session', () => {
         }),
       );
 
-      session.restoreHistory([]);
+      withHistoryMutation(session, (owner) =>
+        session.restoreHistory([], owner),
+      );
 
       const restored = await runExitPlanModeApprovalPrompt();
       expect(restored.toolCall._meta).toEqual(
@@ -16654,22 +16684,18 @@ describe('Session', () => {
             return true;
           },
         );
+        let releaseActivatingPrompt!: () => void;
+        const activatingPromptGate = new Promise<void>((resolve) => {
+          releaseActivatingPrompt = resolve;
+        });
+        let hasQueuedPrompt = false;
         mockChat.sendMessageStream = vi
           .fn()
-          .mockImplementationOnce(
-            async (_model, request: { config: { abortSignal: AbortSignal } }) =>
-              (async function* () {
-                if (!request.config.abortSignal.aborted) {
-                  await new Promise<void>((resolve) =>
-                    request.config.abortSignal.addEventListener(
-                      'abort',
-                      () => resolve(),
-                      { once: true },
-                    ),
-                  );
-                }
-                yield* createEmptyStream();
-              })(),
+          .mockImplementationOnce(async () =>
+            (async function* () {
+              await activatingPromptGate;
+              yield* createEmptyStream();
+            })(),
           )
           .mockResolvedValueOnce(createEmptyStream());
         session = new Session(
@@ -16677,12 +16703,22 @@ describe('Session', () => {
           mockConfig,
           mockClient,
           mockSettings,
+          undefined,
+          undefined,
+          { hasQueuedPrompt: () => hasQueuedPrompt },
         );
 
-        const activating = session.prompt({
-          sessionId: 'test-session-id',
-          prompt: [{ type: 'text', text: 'set a goal to check weather' }],
-        });
+        const activating = session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'set a goal to check weather' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: randomUUID(),
+          },
+        );
         await vi.waitFor(() => {
           expect(mockChat.sendMessageStream).toHaveBeenCalledTimes(1);
         });
@@ -16698,6 +16734,13 @@ describe('Session', () => {
         await Promise.resolve();
         expect(mockChat.sendMessageStream).toHaveBeenCalledTimes(1);
 
+        // The bridge-admitted successor is visible at the turn boundary, so
+        // the continuation stays queued until the FIFO dispatches that
+        // successor into Session.prompt.
+        hasQueuedPrompt = true;
+        releaseActivatingPrompt();
+        await activating;
+        hasQueuedPrompt = false;
         const second = session.prompt({
           sessionId: 'test-session-id',
           prompt: [{ type: 'text', text: 'user input' }],
@@ -16705,7 +16748,7 @@ describe('Session', () => {
         await vi.waitFor(() => {
           expect(mockChat.sendMessageStream).toHaveBeenCalledTimes(2);
         });
-        await Promise.all([activating, second]);
+        await second;
 
         expect(mockGoalRuntime.releaseTurn).toHaveBeenCalledWith(
           'goal-runtime:continuation-turn',
@@ -26859,16 +26902,25 @@ describe('Session', () => {
       });
     }
 
-    it('cleans up an admitted retry cancelled during previous-turn drain', async () => {
+    it('cleans up an admitted retry cancelled during writer admission', async () => {
       rebuildSessionWithGuard();
-      let releasePreviousTurn!: () => void;
-      const previousTurn = new Promise<void>((resolve) => {
-        releasePreviousTurn = resolve;
+      let releaseAdmission!: () => void;
+      const admission = new Promise<void>((resolve) => {
+        releaseAdmission = resolve;
       });
+      let markAdmissionStarted!: () => void;
+      const admissionStarted = new Promise<void>((resolve) => {
+        markAdmissionStarted = resolve;
+      });
+      vi.mocked(mockConfig.assertCanStartTurn).mockImplementationOnce(
+        async () => {
+          markAdmissionStarted();
+          await admission;
+        },
+      );
       const cancellation = new AbortController();
       const internals = session as unknown as {
         pendingPrompt: AbortController | null;
-        pendingPromptCompletion: Promise<void> | null;
         todoStopGuard: {
           hasTrustedUnfinishedState: boolean;
           isHardSuspended: boolean;
@@ -26880,7 +26932,6 @@ describe('Session', () => {
         true,
       );
       expect(internals.todoStopGuard.hasTrustedUnfinishedState).toBe(true);
-      internals.pendingPromptCompletion = previousTurn;
 
       const prompt = session.prompt(
         {
@@ -26891,13 +26942,11 @@ describe('Session', () => {
         undefined,
         cancellation.signal,
       );
-      await vi.waitFor(() => {
-        expect(internals.pendingPrompt).not.toBeNull();
-        expect(internals.todoStopGuard.isHardSuspended).toBe(false);
-      });
+      await admissionStarted;
+      expect(internals.todoStopGuard.isHardSuspended).toBe(false);
 
       cancellation.abort();
-      releasePreviousTurn();
+      releaseAdmission();
 
       await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' });
       expect(internals.pendingPrompt).toBeNull();
@@ -29989,6 +30038,184 @@ describe('Session', () => {
       );
     });
 
+    it('records an early queue release only for the active prompt owner', () => {
+      rebuildSessionWithGuard();
+      const internals = session as unknown as {
+        promptInvocationOwner: object;
+        promptInvocationOwnerPromptId?: string;
+        automaticBoundaryReleasedBeforeRecord: Set<string>;
+      };
+      internals.promptInvocationOwner = {};
+      internals.promptInvocationOwnerPromptId = 'current-owner';
+
+      expect(session.releaseTodoStopGuardQueuedPromptWait('old-owner')).toBe(
+        false,
+      );
+      expect(
+        internals.automaticBoundaryReleasedBeforeRecord.has('old-owner'),
+      ).toBe(false);
+      expect(
+        session.releaseTodoStopGuardQueuedPromptWait('current-owner'),
+      ).toBe(true);
+      expect(
+        internals.automaticBoundaryReleasedBeforeRecord.has('current-owner'),
+      ).toBe(true);
+    });
+
+    it('clears an early release when no queued successor remains at the boundary', async () => {
+      session.dispose();
+      let hasQueuedPrompt = true;
+      session = new Session(
+        'test-session-id',
+        mockConfig,
+        mockClient,
+        mockSettings,
+        undefined,
+        undefined,
+        {
+          inspectRemoteQueue: false,
+          hasQueuedPrompt: () => hasQueuedPrompt,
+        },
+      );
+      let markStreamStarted!: () => void;
+      const streamStarted = new Promise<void>((resolve) => {
+        markStreamStarted = resolve;
+      });
+      let releaseStream!: () => void;
+      const streamGate = new Promise<void>((resolve) => {
+        releaseStream = resolve;
+      });
+      async function* heldStream() {
+        markStreamStarted();
+        await streamGate;
+        yield* createEmptyStream();
+      }
+      mockChat.sendMessageStream = vi.fn().mockResolvedValue(heldStream());
+      const promptId = 'prompt-with-removed-successor';
+      const prompt = session.prompt(
+        {
+          sessionId: 'test-session-id',
+          prompt: [{ type: 'text', text: 'finish without the removed item' }],
+        },
+        { version: 1, sessionId: 'test-session-id', promptId },
+      );
+      await streamStarted;
+
+      expect(session.releaseTodoStopGuardQueuedPromptWait(promptId)).toBe(true);
+      hasQueuedPrompt = false;
+      releaseStream();
+
+      await expect(prompt).resolves.toBeDefined();
+      const internals = session as unknown as {
+        automaticBoundaryReleasedBeforeRecord: Set<string>;
+      };
+      expect(internals.automaticBoundaryReleasedBeforeRecord.size).toBe(0);
+    });
+
+    it('does not rearm a stale boundary watchdog after a successor starts', async () => {
+      vi.useFakeTimers();
+      try {
+        session.dispose();
+        let inspectionCount = 0;
+        let markWatchdogInspectionStarted!: () => void;
+        const watchdogInspectionStarted = new Promise<void>((resolve) => {
+          markWatchdogInspectionStarted = resolve;
+        });
+        let resolveWatchdogInspection!: (
+          value: Record<string, unknown>,
+        ) => void;
+        const watchdogInspection = new Promise<Record<string, unknown>>(
+          (resolve) => {
+            resolveWatchdogInspection = resolve;
+          },
+        );
+        vi.mocked(mockClient.extMethod).mockImplementation(
+          async (_method, params) => {
+            if (params['inspectQueuedPromptOnly'] !== true) return {};
+            inspectionCount += 1;
+            if (inspectionCount === 1) return { hasQueuedPrompt: true };
+            if (inspectionCount === 2) {
+              markWatchdogInspectionStarted();
+              return watchdogInspection;
+            }
+            return { hasQueuedPrompt: false };
+          },
+        );
+        session = new Session(
+          'test-session-id',
+          mockConfig,
+          mockClient,
+          mockSettings,
+          undefined,
+          undefined,
+          { inspectRemoteQueue: true, hasQueuedPrompt: () => false },
+        );
+        mockChat.sendMessageStream = vi
+          .fn()
+          .mockResolvedValueOnce(createEmptyStream());
+
+        await session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'first prompt' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'first-prompt',
+          },
+        );
+        await vi.advanceTimersByTimeAsync(250);
+        await watchdogInspectionStarted;
+
+        let markSuccessorStarted!: () => void;
+        const successorStarted = new Promise<void>((resolve) => {
+          markSuccessorStarted = resolve;
+        });
+        let releaseSuccessor!: () => void;
+        const successorGate = new Promise<void>((resolve) => {
+          releaseSuccessor = resolve;
+        });
+        async function* heldSuccessorStream() {
+          markSuccessorStarted();
+          await successorGate;
+          yield* createEmptyStream();
+        }
+        mockChat.sendMessageStream = vi
+          .fn()
+          .mockResolvedValueOnce(heldSuccessorStream());
+        const successor = session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'successor prompt' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'successor-prompt',
+          },
+        );
+        await successorStarted;
+        resolveWatchdogInspection({ hasQueuedPrompt: true });
+        await Promise.resolve();
+        await Promise.resolve();
+
+        const internals = session as unknown as {
+          automaticBoundaryWatchdog?: NodeJS.Timeout;
+          automaticBoundaryWatchdogOwner?: string;
+          deferredAutomaticBoundary?: unknown;
+        };
+        expect(internals.automaticBoundaryWatchdog).toBeUndefined();
+        expect(internals.automaticBoundaryWatchdogOwner).toBeUndefined();
+        expect(internals.deferredAutomaticBoundary).toBeUndefined();
+
+        releaseSuccessor();
+        await successor;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('drains old deferred work when the FIFO prompt errors before arming', async () => {
       rebuildSessionWithGuard();
       installPendingTodoTool();
@@ -30439,198 +30666,139 @@ describe('Session', () => {
       );
     });
 
-    it.each([
-      { label: 'a newer prompt supersedes the turn', cancel: false },
-      { label: 'the user cancels the turn', cancel: true },
-    ])(
-      'preserves combined continuation tool responses when $label',
-      async ({ cancel }) => {
-        rebuildSessionWithGuard();
-        const execute = installPendingTodoTool();
-        const toolResult = {
-          llmContent: JSON.stringify(pendingTodos),
-          returnDisplay: {
-            type: 'todo_list',
-            todos: pendingTodos,
-            changes: {},
-          },
-        };
-        let secondToolStarted!: () => void;
-        const secondToolStart = new Promise<void>((resolve) => {
-          secondToolStarted = resolve;
-        });
-        let releaseSecondTool!: () => void;
-        const secondToolGate = new Promise<void>((resolve) => {
-          releaseSecondTool = resolve;
-        });
-        let toolCallCount = 0;
-        execute.mockImplementation(async () => {
-          if (++toolCallCount === 2) {
-            secondToolStarted();
-            await secondToolGate;
-          }
-          return toolResult;
-        });
-        const toolCallStream = (id: string) =>
-          createStreamWithChunks([
-            {
-              type: core.StreamEventType.CHUNK,
-              value: {
-                functionCalls: [
-                  {
-                    id,
-                    name: core.ToolNames.TODO_WRITE,
-                    args: { todos: pendingTodos },
-                  },
-                ],
-              },
-            },
-          ]);
-        mockChat.sendMessageStream = vi
-          .fn()
-          .mockResolvedValueOnce(toolCallStream('todo-before-supersession'))
-          .mockResolvedValueOnce(createEmptyStream())
-          .mockResolvedValueOnce(
-            toolCallStream('combined-tool-before-supersession'),
-          )
-          .mockResolvedValue(createEmptyStream());
-        let stopCalls = 0;
-        const messageBus = {
-          request: vi.fn().mockImplementation(async (request) => {
-            if (request.eventName !== 'Stop') {
-              return { success: true, output: {} };
-            }
-            return ++stopCalls === 1
-              ? {
-                  success: true,
-                  output: {
-                    decision: 'block',
-                    reason: 'external continuation before supersession',
-                  },
-                }
-              : { success: true, output: {} };
-          }),
-        };
-        mockConfig.getMessageBus = vi.fn().mockReturnValue(messageBus);
-        mockConfig.hasHooksForEvent = vi
-          .fn()
-          .mockImplementation((name: string) => name === 'Stop');
-
-        const firstPrompt = runGuardPrompt();
-        await secondToolStart;
-        let secondPrompt: ReturnType<typeof session.prompt> | undefined;
-        if (cancel) {
-          await session.cancelPendingPrompt();
-        } else {
-          const internals = session as unknown as {
-            pendingPrompt: AbortController | null;
-          };
-          const firstOwner = internals.pendingPrompt;
-          secondPrompt = session.prompt({
-            sessionId: 'test-session-id',
-            prompt: [{ type: 'text', text: 'superseding prompt' }],
-          });
-          await vi.waitFor(() => {
-            expect(internals.pendingPrompt).not.toBe(firstOwner);
-          });
-        }
-        releaseSecondTool();
-
-        const firstResult = await firstPrompt;
-        await secondPrompt;
-
-        expect(mockChat.addHistory).toHaveBeenCalledWith({
-          role: 'user',
-          parts: [
-            expect.objectContaining({
-              functionResponse: expect.objectContaining({
-                id: 'combined-tool-before-supersession',
-              }),
-            }),
-          ],
-        });
-        expect(firstResult).toEqual({ stopReason: 'cancelled' });
-      },
-    );
-
-    it('preserves newer prompt state and includes tasks created while the superseded prompt unwinds', async () => {
+    it('preserves combined continuation tool responses when the user cancels the turn', async () => {
       rebuildSessionWithGuard();
-      installPendingTodoTool();
-      const internals = session as unknown as {
-        todoStopGuardDrainAutomaticQueuesWhenIdle: boolean;
+      const execute = installPendingTodoTool();
+      const toolResult = {
+        llmContent: JSON.stringify(pendingTodos),
+        returnDisplay: {
+          type: 'todo_list',
+          todos: pendingTodos,
+          changes: {},
+        },
       };
-      let enterWait!: () => void;
-      const waitStarted = new Promise<void>((resolve) => {
-        enterWait = resolve;
+      let secondToolStarted!: () => void;
+      const secondToolStart = new Promise<void>((resolve) => {
+        secondToolStarted = resolve;
       });
-      let releaseWait!: () => void;
-      const waitGate = new Promise<void>((resolve) => {
-        releaseWait = resolve;
+      let releaseSecondTool!: () => void;
+      const secondToolGate = new Promise<void>((resolve) => {
+        releaseSecondTool = resolve;
       });
-      let waitCalls = 0;
-      session.messageRewriter = {
-        interceptUpdate: vi.fn().mockResolvedValue(undefined),
-        waitForPendingRewrites: vi.fn(async () => {
-          if (++waitCalls !== 1) return;
-          enterWait();
-          await waitGate;
-        }),
-      } as unknown as NonNullable<Session['messageRewriter']>;
-      let enterSecondSend!: () => void;
-      const secondSendStarted = new Promise<void>((resolve) => {
-        enterSecondSend = resolve;
+      let toolCallCount = 0;
+      execute.mockImplementation(async () => {
+        if (++toolCallCount === 2) {
+          secondToolStarted();
+          await secondToolGate;
+        }
+        return toolResult;
       });
-      let releaseSecondSend!: () => void;
-      const secondSendGate = new Promise<void>((resolve) => {
-        releaseSecondSend = resolve;
-      });
+      const toolCallStream = (id: string) =>
+        createStreamWithChunks([
+          {
+            type: core.StreamEventType.CHUNK,
+            value: {
+              functionCalls: [
+                {
+                  id,
+                  name: core.ToolNames.TODO_WRITE,
+                  args: { todos: pendingTodos },
+                },
+              ],
+            },
+          },
+        ]);
       mockChat.sendMessageStream = vi
         .fn()
+        .mockResolvedValueOnce(toolCallStream('todo-before-supersession'))
         .mockResolvedValueOnce(createEmptyStream())
-        .mockImplementationOnce(async () => {
-          enterSecondSend();
-          await secondSendGate;
-          return createStreamWithChunks([
-            {
-              type: core.StreamEventType.CHUNK,
-              value: {
-                functionCalls: [
-                  {
-                    id: 'second-prompt-todo',
-                    name: core.ToolNames.TODO_WRITE,
-                    args: { todos: pendingTodos },
-                  },
-                ],
-              },
-            },
-          ]);
-        })
+        .mockResolvedValueOnce(
+          toolCallStream('combined-tool-before-supersession'),
+        )
         .mockResolvedValue(createEmptyStream());
+      let stopCalls = 0;
+      const messageBus = {
+        request: vi.fn().mockImplementation(async (request) => {
+          if (request.eventName !== 'Stop') {
+            return { success: true, output: {} };
+          }
+          return ++stopCalls === 1
+            ? {
+                success: true,
+                output: {
+                  decision: 'block',
+                  reason: 'external continuation before supersession',
+                },
+              }
+            : { success: true, output: {} };
+        }),
+      };
+      mockConfig.getMessageBus = vi.fn().mockReturnValue(messageBus);
+      mockConfig.hasHooksForEvent = vi
+        .fn()
+        .mockImplementation((name: string) => name === 'Stop');
 
       const firstPrompt = runGuardPrompt();
-      await waitStarted;
-      const secondPrompt = session.prompt({
-        sessionId: 'test-session-id',
-        prompt: [{ type: 'text', text: 'new work chain' }],
+      await secondToolStart;
+      await session.cancelPendingPrompt();
+      releaseSecondTool();
+
+      const firstResult = await firstPrompt;
+
+      expect(mockChat.addHistory).toHaveBeenCalledWith({
+        role: 'user',
+        parts: [
+          expect.objectContaining({
+            functionResponse: expect.objectContaining({
+              id: 'combined-tool-before-supersession',
+            }),
+          }),
+        ],
       });
-      internals.todoStopGuardDrainAutomaticQueuesWhenIdle = true;
-      mockBackgroundTaskRegistry.getAll.mockReturnValue([
-        {
-          id: 'old-unwind-agent',
-          isBackgrounded: true,
-          status: 'running',
-          notified: false,
-        },
-      ]);
-      releaseWait();
-      await secondSendStarted;
-
-      expect(internals.todoStopGuardDrainAutomaticQueuesWhenIdle).toBe(true);
-      releaseSecondSend();
-
-      const [firstResult] = await Promise.all([firstPrompt, secondPrompt]);
       expect(firstResult).toEqual({ stopReason: 'cancelled' });
-      expect(mockChat.sendMessageStream).toHaveBeenCalledTimes(5);
+    });
+
+    it('rejects a concurrent Session.prompt bypass without superseding the active turn', async () => {
+      rebuildSessionWithGuard();
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      let releasePrompt!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releasePrompt = resolve;
+      });
+      mockChat.sendMessageStream = vi.fn(async () => {
+        markStarted();
+        await gate;
+        return createEmptyStream();
+      });
+
+      const firstPrompt = session.prompt({
+        sessionId: 'test-session-id',
+        prompt: [{ type: 'text', text: 'first' }],
+      });
+      await started;
+      const activeOwner = (
+        session as unknown as { pendingPrompt: AbortController | null }
+      ).pendingPrompt;
+
+      await expect(
+        session.prompt({
+          sessionId: 'test-session-id',
+          prompt: [{ type: 'text', text: 'bypass' }],
+        }),
+      ).rejects.toMatchObject({
+        data: { errorKind: 'prompt_executor_busy' },
+      });
+      expect(
+        (session as unknown as { pendingPrompt: AbortController | null })
+          .pendingPrompt,
+      ).toBe(activeOwner);
+      expect(activeOwner?.signal.aborted).toBe(false);
+
+      releasePrompt();
+      await expect(firstPrompt).resolves.toEqual({ stopReason: 'end_turn' });
     });
 
     it('reclassifies queued notifications when a new work chain starts', async () => {
@@ -31267,7 +31435,9 @@ describe('Session', () => {
       mockChat.sendMessageStream = vi
         .fn()
         .mockResolvedValue(createEmptyStream());
-      session.restoreHistory([]);
+      withHistoryMutation(session, (owner) =>
+        session.restoreHistory([], owner),
+      );
 
       await vi.waitFor(() => {
         expect(mockChat.sendMessageStream).toHaveBeenCalledTimes(1);
@@ -31305,7 +31475,9 @@ describe('Session', () => {
         { role: 'model', parts: [{ text: 'working' }] },
       ];
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
-      session.rewindToTurn(0);
+      withHistoryMutation(session, (owner) =>
+        session.rewindToTurn(0, undefined, owner),
+      );
 
       mockBackgroundTaskRegistry.getAll.mockReturnValue([
         {

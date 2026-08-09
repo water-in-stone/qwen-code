@@ -100,7 +100,7 @@ function makeClient(
   // required (policy/vote/forgetSession/peekSessionFor/pendingCount).
   const throwerMediator = { request: noPermissionFlow } as never;
   return new BridgeClient(
-    (managedGuard?.resolveEntry ?? noPermissionFlow) as never, // resolveEntry
+    (managedGuard?.resolveEntry ?? (() => undefined)) as never, // resolveEntry
     noPermissionFlow as never, // resolvePendingRestoreEvents
     throwerMediator, // mediator (F3 Commit 3)
     0, // permissionTimeoutMs (disabled)
@@ -240,6 +240,71 @@ describe('BridgeClient — background notification turn boundary', () => {
     });
 
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('fails prompt-scoped file operations before invoking the host adapter', async () => {
+    const writeText = vi.fn();
+    const readText = vi.fn();
+    const entry = {
+      sessionId: 'sess:timed-out-files',
+      timedOutExecutorPromptId: 'prompt-expired',
+    };
+    const client = makeClient(
+      { writeText, readText },
+      {
+        resolveEntry: (sessionId?: string) =>
+          sessionId === entry.sessionId ? entry : undefined,
+        handler: vi.fn(),
+      },
+    );
+
+    await expect(
+      client.writeTextFile({
+        sessionId: entry.sessionId,
+        path: '/tmp/late-write',
+        content: 'late',
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(
+      client.readTextFile({
+        sessionId: entry.sessionId,
+        path: '/tmp/late-read',
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(writeText).not.toHaveBeenCalled();
+    expect(readText).not.toHaveBeenCalled();
+  });
+
+  it('still publishes authoritative title reconciliation while fenced', async () => {
+    const publish = vi.fn().mockReturnValue(true);
+    const entry = {
+      sessionId: 'sess:timed-out-title',
+      timedOutExecutorPromptId: 'prompt-expired',
+      events: { publish },
+    };
+    const client = new BridgeClient(
+      ((sessionId: string) =>
+        sessionId === entry.sessionId ? entry : undefined) as never,
+      (() => undefined) as never,
+      { request: () => Promise.reject(new Error('unexpected')) } as never,
+      0,
+      Infinity,
+    );
+
+    await client.extNotification('qwen/notify/session/title-update', {
+      sessionId: entry.sessionId,
+      title: 'Authoritative title',
+      titleSource: 'auto',
+    });
+
+    expect(publish).toHaveBeenCalledWith({
+      type: 'session_metadata_updated',
+      data: {
+        sessionId: entry.sessionId,
+        displayName: 'Authoritative title',
+        titleSource: 'auto',
+      },
+    });
   });
 });
 
@@ -2856,6 +2921,94 @@ describe('BridgeClient — requestPermission pre-publish collision guard', () =>
     // And the cap-index was never touched (only added AFTER publish).
     expect(fakeEntry.pendingPermissionIds.size).toBe(0);
   });
+
+  it('cancels permission requests from an executor fenced by its deadline', async () => {
+    const publish = vi.fn().mockReturnValue(true);
+    const request = vi.fn();
+    const fakeEntry = {
+      sessionId: 'sess:timed-out',
+      timedOutExecutorPromptId: 'prompt-expired',
+      pendingPermissionIds: new Set<string>(),
+      pendingInteractions: new Map(),
+      events: { publish },
+    };
+    const client = new BridgeClient(
+      ((sessionId: string) =>
+        sessionId === fakeEntry.sessionId ? fakeEntry : undefined) as never,
+      (() => undefined) as never,
+      { request } as never,
+      0,
+      Infinity,
+    );
+
+    await expect(
+      client.requestPermission({
+        sessionId: fakeEntry.sessionId,
+        toolCall: { toolCallId: 'late-tool', title: 'Late tool' },
+        options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }],
+      }),
+    ).resolves.toEqual({ outcome: { outcome: 'cancelled' } });
+    expect(publish).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('BridgeClient — timed-out executor event fence', () => {
+  it('suppresses ordinary session frames after the caller deadline', async () => {
+    const publish = vi.fn().mockReturnValue(true);
+    const entry = {
+      sessionId: 'sess:timed-out-events',
+      timedOutExecutorPromptId: 'prompt-expired',
+      activePromptId: 'prompt-expired',
+      events: { publish },
+      pendingPermissionIds: new Set<string>(),
+      pendingInteractions: new Map(),
+    };
+    const client = new BridgeClient(
+      ((sessionId: string) =>
+        sessionId === entry.sessionId ? entry : undefined) as never,
+      (() => undefined) as never,
+      { request: () => Promise.reject(new Error('unexpected')) } as never,
+      0,
+      Infinity,
+    );
+
+    await client.sessionUpdate({
+      sessionId: entry.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'must stay hidden' },
+      },
+    });
+
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a late follow-up suggestion after the caller deadline', async () => {
+    const publish = vi.fn().mockReturnValue(true);
+    const entry = {
+      sessionId: 'sess:timed-out-suggestion',
+      timedOutExecutorPromptId: 'prompt-expired',
+      events: { publish },
+    };
+    const client = new BridgeClient(
+      ((sessionId: string) =>
+        sessionId === entry.sessionId ? entry : undefined) as never,
+      (() => undefined) as never,
+      { request: () => Promise.reject(new Error('unexpected')) } as never,
+      0,
+      Infinity,
+    );
+
+    await client.extNotification('qwen/notify/session/prompt-suggestion', {
+      v: 1,
+      sessionId: entry.sessionId,
+      suggestion: 'must stay hidden',
+      promptId: 'persisted-turn-id',
+    });
+
+    expect(publish).not.toHaveBeenCalled();
+  });
 });
 
 describe('BridgeClient — pending interaction classification', () => {
@@ -3456,6 +3609,61 @@ describe('BridgeClient — mid-turn queue drain (craft/drainMidTurnQueue)', () =
     ).resolves.toEqual({ messages: [], hasQueuedPrompt: false });
   });
 
+  it('inspects successor ownership without draining while the executor is fenced', async () => {
+    const publish = vi.fn().mockReturnValue(true);
+    const entry = {
+      sessionId: 'sess:inspect-only',
+      activePromptId: 'prompt-current',
+      promptActive: true,
+      timedOutExecutorPromptId: 'prompt-current',
+      queuedSuccessorWaitOwnerPromptId: undefined as string | undefined,
+      midTurnMessageQueue: [
+        { messageId: 'mid-preserved', text: 'do not splice' },
+      ],
+      pendingPromptList: [
+        {
+          promptId: 'prompt-next',
+          queuedAt: Date.now(),
+          text: 'next',
+          state: 'queued' as const,
+          abortController: new AbortController(),
+        },
+      ],
+      events: { publish },
+    };
+    const client = new BridgeClient(
+      ((sessionId: string) =>
+        sessionId === entry.sessionId ? entry : undefined) as never,
+      thrower as never,
+      { request: thrower } as never,
+      0,
+      Infinity,
+    );
+
+    await expect(
+      client.extMethod('craft/drainMidTurnQueue', {
+        sessionId: entry.sessionId,
+        inspectQueuedPromptOnly: true,
+        promptId: 'prompt-current',
+      }),
+    ).resolves.toEqual({ messages: [], hasQueuedPrompt: true });
+    expect(entry.midTurnMessageQueue).toEqual([
+      { messageId: 'mid-preserved', text: 'do not splice' },
+    ]);
+    expect(entry.queuedSuccessorWaitOwnerPromptId).toBe('prompt-current');
+
+    entry.pendingPromptList.length = 0;
+    entry.promptActive = false;
+    await expect(
+      client.extMethod('craft/drainMidTurnQueue', {
+        sessionId: entry.sessionId,
+        inspectQueuedPromptOnly: true,
+        promptId: 'prompt-current',
+      }),
+    ).resolves.toEqual({ messages: [], hasQueuedPrompt: false });
+    expect(entry.queuedSuccessorWaitOwnerPromptId).toBeUndefined();
+  });
+
   it('claims only for the live running owner and reports queued competition', async () => {
     const running = {
       promptId: 'running',
@@ -3479,9 +3687,7 @@ describe('BridgeClient — mid-turn queue drain (craft/drainMidTurnQueue)', () =
       settledMidTurnMessageIds: [],
       pendingPromptList: [running, queued],
       events: { publish: vi.fn() },
-      todoStopGuardAwaitingQueuedPromptOwnerPromptId: undefined as
-        | string
-        | undefined,
+      queuedSuccessorWaitOwnerPromptId: undefined as string | undefined,
     };
     const client = new BridgeClient(
       ((sessionId: string) =>
@@ -3520,9 +3726,7 @@ describe('BridgeClient — mid-turn queue drain (craft/drainMidTurnQueue)', () =
         promptId: 'running',
       }),
     ).resolves.toEqual({ claimed: false, hasQueuedPrompt: false });
-    expect(entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId).toBe(
-      'running',
-    );
+    expect(entry.queuedSuccessorWaitOwnerPromptId).toBe('running');
 
     competing.abortController.abort();
     await expect(

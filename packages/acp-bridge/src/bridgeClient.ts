@@ -628,7 +628,9 @@ export interface BridgeClientSessionEntry {
   /** Complete prompts waiting behind the currently running prompt. */
   pendingPromptList: PendingPromptEntry[];
   /** Bridge prompt that owns the child Guard wait for this FIFO. */
-  todoStopGuardAwaitingQueuedPromptOwnerPromptId?: string;
+  queuedSuccessorWaitOwnerPromptId?: string;
+  /** Caller-visible deadline fired while this exact child request still drains. */
+  timedOutExecutorPromptId?: string;
   /** True while a prompt is executing for this session. */
   promptActive?: boolean;
   /** Admitted id for the prompt currently executing on this session. */
@@ -820,6 +822,9 @@ export class BridgeClient implements Client {
   ): Promise<RequestPermissionResponse> {
     const entry = this.resolveEntry(params.sessionId);
     if (!entry) return { outcome: { outcome: 'cancelled' } };
+    if (entry.timedOutExecutorPromptId) {
+      return { outcome: { outcome: 'cancelled' } };
+    }
 
     // Bd1z5: per-session cap. Reject before issuing so we never
     // grow `pendingPermissionIds` past the limit.
@@ -933,8 +938,10 @@ export class BridgeClient implements Client {
       entry?.events ?? this.resolvePendingRestoreEvents(params.sessionId);
     if (!events) return;
     const prepared = this.prepareSessionUpdateFrames(params, entry);
-    for (const frame of prepared.frames) {
-      events.publish(frame);
+    if (!entry?.timedOutExecutorPromptId) {
+      for (const frame of prepared.frames) {
+        events.publish(frame);
+      }
     }
     // Daemon token-burn accounting for LIVE turns only (see method doc). Batch
     // load-replay routes through seedSessionUpdates, not here, so replayed
@@ -1232,6 +1239,41 @@ export class BridgeClient implements Client {
     if (!sessionId) return { messages: [], hasQueuedPrompt: false };
     const entry = this.resolveEntry(sessionId);
     if (!entry) return { messages: [], hasQueuedPrompt: false };
+    const inspectQueuedPromptOnly = params['inspectQueuedPromptOnly'] === true;
+    const inspectingPromptId =
+      typeof params['promptId'] === 'string' && params['promptId'].length > 0
+        ? params['promptId']
+        : undefined;
+    const hasQueuedPrompt = entry.pendingPromptList.some(
+      (prompt) =>
+        prompt.state === 'queued' &&
+        !prompt.queueRetired &&
+        !prompt.abortController.signal.aborted,
+    );
+    if (inspectQueuedPromptOnly) {
+      const hasPromotedSuccessor =
+        inspectingPromptId !== undefined &&
+        entry.promptActive === true &&
+        entry.activePromptId !== inspectingPromptId;
+      if (hasQueuedPrompt && inspectingPromptId !== undefined) {
+        entry.queuedSuccessorWaitOwnerPromptId = inspectingPromptId;
+      } else if (
+        !hasPromotedSuccessor &&
+        entry.queuedSuccessorWaitOwnerPromptId === inspectingPromptId
+      ) {
+        delete entry.queuedSuccessorWaitOwnerPromptId;
+      }
+      return {
+        messages: [],
+        hasQueuedPrompt: hasQueuedPrompt || hasPromotedSuccessor,
+      };
+    }
+    if (entry.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     const drained = entry.midTurnMessageQueue.splice(0);
     if (drained.length > 0) {
       // Record the handoff so clients that lost their bookkeeping (page
@@ -1255,10 +1297,6 @@ export class BridgeClient implements Client {
     // Queue-only entries are private coordinator steering, not UI transcript.
     const echoed = drained.filter((item) => !item.queueOnly);
     const messages = drained.map((item) => item.text);
-    const hasQueuedPrompt = entry.pendingPromptList.some(
-      (prompt) =>
-        prompt.state === 'queued' && !prompt.abortController.signal.aborted,
-    );
     if (echoed.length > 0) {
       // `publish()` never throws — it returns `undefined` on a closed bus (see
       // EventBus.publish's never-throws contract: "Don't add try/catch wrappers
@@ -1377,6 +1415,9 @@ export class BridgeClient implements Client {
     }
     const entry = this.resolveEntry(sessionId);
     if (!entry) return { claimed: false, hasQueuedPrompt: false };
+    if (entry.timedOutExecutorPromptId) {
+      return { claimed: false, hasQueuedPrompt: false };
+    }
 
     const livePrompts = entry.pendingPromptList.filter(
       (prompt) => !prompt.abortController.signal.aborted,
@@ -1404,11 +1445,11 @@ export class BridgeClient implements Client {
         (prompt) => prompt.state === 'queued',
       );
       if (hasQueuedPrompt) {
-        entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId = promptId;
+        entry.queuedSuccessorWaitOwnerPromptId = promptId;
         return { claimed: false, hasQueuedPrompt: true };
       }
-      if (entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId === promptId) {
-        delete entry.todoStopGuardAwaitingQueuedPromptOwnerPromptId;
+      if (entry.queuedSuccessorWaitOwnerPromptId === promptId) {
+        delete entry.queuedSuccessorWaitOwnerPromptId;
       }
       return { claimed: true, hasQueuedPrompt: false };
     }
@@ -1494,6 +1535,12 @@ export class BridgeClient implements Client {
       throw RequestError.invalidParams(
         undefined,
         'Invalid channel delivery correlation',
+      );
+    }
+    if (source === 'prompt' && entry.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
       );
     }
 
@@ -1617,6 +1664,15 @@ export class BridgeClient implements Client {
         `[demux] session=${sessionId} type=client_mcp_message action=forwarded_without_session reason=session_registration_pending`,
       );
     }
+    if (
+      typeof sessionId === 'string' &&
+      this.resolveEntry(sessionId)?.timedOutExecutorPromptId
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     const response = await send(
       payload,
       typeof sessionId === 'string' && ownsSession ? { sessionId } : undefined,
@@ -1688,6 +1744,12 @@ export class BridgeClient implements Client {
         '`callerSessionId` is required and must name a session owned by this connection',
       );
     }
+    if (this.resolveEntry(callerSessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     const model = params['model'];
     const result = await this.onCreateSubSession({
       prompt,
@@ -1728,6 +1790,12 @@ export class BridgeClient implements Client {
       throw RequestError.invalidParams(
         undefined,
         '`callerSessionId` is required and must name a session owned by this connection',
+      );
+    }
+    if (this.resolveEntry(callerSessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
       );
     }
     const result = await handler({ callerSessionId });
@@ -1776,6 +1844,12 @@ export class BridgeClient implements Client {
         'Invalid Live task-tool request.',
       );
     }
+    if (this.resolveEntry(callerSessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     return handler({
       callerSessionId,
       name: name as (typeof LIVE_TASK_TOOL_NAMES)[number],
@@ -1805,6 +1879,12 @@ export class BridgeClient implements Client {
       throw RequestError.invalidParams(
         undefined,
         'Invalid Live speak-to-user request.',
+      );
+    }
+    if (this.resolveEntry(callerSessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
       );
     }
     await handler({ callerSessionId, message });
@@ -2071,6 +2151,7 @@ export class BridgeClient implements Client {
       }
       const entry = this.resolveEntry(sessionId);
       if (!entry) return;
+      if (entry.timedOutExecutorPromptId) return;
       // This child-generated promptId identifies a persisted history turn, not
       // the daemon's admitted HTTP prompt UUID. Keep it in the legacy payload
       // and do not promote it to the envelope correlation field.
@@ -2612,6 +2693,12 @@ export class BridgeClient implements Client {
   async writeTextFile(
     params: WriteTextFileRequest,
   ): Promise<WriteTextFileResponse> {
+    if (this.resolveEntry(params.sessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     // Delegate to the injected `BridgeFileSystem` when present.
     // Production `qwen serve` wires `WorkspaceFileSystem` through a
     // serve-side adapter so writes get the trust-gate + TOCTOU +
@@ -2768,6 +2855,12 @@ export class BridgeClient implements Client {
   async readTextFile(
     params: ReadTextFileRequest,
   ): Promise<ReadTextFileResponse> {
+    if (this.resolveEntry(params.sessionId)?.timedOutExecutorPromptId) {
+      throw RequestError.invalidParams(
+        undefined,
+        'The prompt has already reached its terminal deadline.',
+      );
+    }
     // Delegate to the injected `BridgeFileSystem` when present
     // (parallels the write path above). Production `qwen serve` wires
     // `WorkspaceFileSystem` adapter; tests + Mode A + channels + IDE

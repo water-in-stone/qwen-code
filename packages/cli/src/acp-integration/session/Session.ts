@@ -581,6 +581,18 @@ type QueueToolResultRecord = (
 
 type HistoryMutationRunner = <T>(operation: () => Promise<T>) => Promise<T>;
 
+export interface PromptQueueCoordinator {
+  hasQueuedPrompt(): boolean;
+  inspectRemoteQueue: boolean;
+}
+
+interface DeferredAutomaticBoundary {
+  ownerPromptId: string;
+  followupResult?: PromptResponse;
+  released?: boolean;
+}
+
+type TurnBoundaryInspection = 'clear' | 'queued' | 'unavailable';
 export type DaemonToolLoopState = {
   totalToolCalls: number;
   invalidToolParamErrors: Map<string, number>;
@@ -1532,14 +1544,18 @@ export async function buildAvailableCommandsSnapshot(
 export class Session implements SessionContext {
   private pendingPrompt: AbortController | null = null;
   /**
-   * Tracks the completion of the current prompt so that the next prompt
-   * can await it.  This prevents a new prompt from reading chat history
-   * before the previous prompt's tool results have been added —
-   * a race condition that causes malformed history on Windows where
-   * process termination is slow.
+   * Tracks the current prompt's full settlement for close/drain accounting.
+   * User prompts are serialized by the external FIFO plus
+   * `promptInvocationOwner`; automatic work and teardown still need a promise
+   * they can await after the execution controller has been cleared.
    */
   private pendingPromptCompletion: Promise<void> | null = null;
   private automaticDrainRetry: Promise<void> | null = null;
+  private deferredAutomaticBoundary: DeferredAutomaticBoundary | undefined;
+  private readonly automaticBoundaryReleasedBeforeRecord = new Set<string>();
+  private automaticBoundaryWatchdog: NodeJS.Timeout | undefined;
+  private automaticBoundaryWatchdogOwner: string | undefined;
+  private automaticBoundaryWatchdogAttempt = 0;
   /**
    * Per-turn AbortController for the fire-and-forget follow-up suggestion
    * generation. Aborted on the top of the next `prompt()` and on
@@ -1633,7 +1649,10 @@ export class Session implements SessionContext {
   // on a session whose registries are already unregistered.
   private disposed = false;
   private closing = false;
-  private historyMutationActive = false;
+  private promptInvocationOwner: object | undefined;
+  private promptInvocationCompletion: Promise<void> | null = null;
+  private promptInvocationOwnerPromptId: string | undefined;
+  private historyMutationOwner: (() => void) | undefined;
   private closeGateCompletion: Promise<void> | null = null;
   private resolveCloseGate: (() => void) | null = null;
   private unsubscribeChatRecordingFailure?: () => void;
@@ -1696,6 +1715,7 @@ export class Session implements SessionContext {
      * a full snapshot; the Session itself keeps no reporting state.
      */
     private readonly onActiveWorkChanged?: () => void,
+    private readonly promptQueueCoordinator?: PromptQueueCoordinator,
   ) {
     this.sessionId = id;
     this.runtimeBaseDir = config.storage.getRuntimeBaseDir();
@@ -1969,7 +1989,9 @@ export class Session implements SessionContext {
       this.closing ||
       this.goalProcessing ||
       this.pendingPrompt ||
+      this.promptInvocationOwner ||
       this.pendingPromptCompletion ||
+      this.deferredAutomaticBoundary ||
       this.cronProcessing ||
       this.cronAbortController ||
       this.notificationProcessing ||
@@ -2356,12 +2378,25 @@ export class Session implements SessionContext {
   }
 
   releaseTodoStopGuardQueuedPromptWait(promptId: string): boolean {
+    let releasedAutomaticBoundary = false;
+    const deferredBoundary = this.deferredAutomaticBoundary;
+    if (deferredBoundary?.ownerPromptId === promptId) {
+      releasedAutomaticBoundary = true;
+      if (this.pendingPrompt) {
+        deferredBoundary.released = true;
+      } else {
+        this.#consumeDeferredAutomaticBoundary(promptId);
+      }
+    } else if (this.promptInvocationOwnerPromptId === promptId) {
+      this.automaticBoundaryReleasedBeforeRecord.add(promptId);
+      releasedAutomaticBoundary = true;
+    }
     const matchesCurrentWait =
       this.todoStopGuardQueuedPromptPriority &&
       this.todoStopGuardQueuedPromptOwnerPromptId === promptId;
     if (!matchesCurrentWait) {
       if ((this.todoStopGuardClaimOwnerCounts.get(promptId) ?? 0) === 0) {
-        return false;
+        return releasedAutomaticBoundary;
       }
       this.todoStopGuardReleasedDuringClaim.add(promptId);
       if (!this.todoStopGuardQueuedPromptPriority) {
@@ -2371,6 +2406,154 @@ export class Session implements SessionContext {
     }
     this.#clearTodoStopGuardQueuedPromptWait(promptId);
     this.#finishTodoStopGuardQueuedPromptRelease();
+    return true;
+  }
+
+  #clearAutomaticBoundaryWatchdog(expectedOwner?: string): void {
+    if (
+      expectedOwner !== undefined &&
+      this.automaticBoundaryWatchdogOwner !== expectedOwner
+    ) {
+      return;
+    }
+    clearTimeout(this.automaticBoundaryWatchdog);
+    this.automaticBoundaryWatchdog = undefined;
+    this.automaticBoundaryWatchdogOwner = undefined;
+    this.automaticBoundaryWatchdogAttempt = 0;
+  }
+
+  #consumeDeferredAutomaticBoundary(expectedOwner: string): boolean {
+    const boundary = this.deferredAutomaticBoundary;
+    if (!boundary || boundary.ownerPromptId !== expectedOwner) return false;
+    this.deferredAutomaticBoundary = undefined;
+    this.automaticBoundaryReleasedBeforeRecord.delete(expectedOwner);
+    this.#clearAutomaticBoundaryWatchdog(expectedOwner);
+    void this.#drainCronQueue();
+    void this.#drainNotificationQueue();
+    void this.#drainGoalQueue();
+    void this.#startCronSchedulerInRuntime();
+    if (boundary.followupResult) {
+      this.#maybeEmitFollowupSuggestion(boundary.followupResult);
+    }
+    return true;
+  }
+
+  #clearDeferredAutomaticBoundaryForSuccessor(): void {
+    const boundary = this.deferredAutomaticBoundary;
+    if (!boundary) return;
+    this.deferredAutomaticBoundary = undefined;
+    this.automaticBoundaryReleasedBeforeRecord.delete(boundary.ownerPromptId);
+    this.#clearAutomaticBoundaryWatchdog(boundary.ownerPromptId);
+  }
+
+  #inspectTurnBoundary(
+    ownerPromptId: string,
+  ): TurnBoundaryInspection | Promise<TurnBoundaryInspection> {
+    if (this.promptQueueCoordinator?.hasQueuedPrompt()) return 'queued';
+    if (!this.promptQueueCoordinator?.inspectRemoteQueue) return 'clear';
+    return this.#inspectRemoteTurnBoundary(ownerPromptId);
+  }
+
+  async #inspectRemoteTurnBoundary(
+    ownerPromptId: string,
+  ): Promise<TurnBoundaryInspection> {
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    try {
+      const response = await Promise.race([
+        this.client.extMethod(MID_TURN_QUEUE_DRAIN_METHOD, {
+          sessionId: this.sessionId,
+          promptId: ownerPromptId,
+          inspectQueuedPromptOnly: true,
+        }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new MidTurnDrainTimeoutError()),
+            MID_TURN_QUEUE_DRAIN_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      return isRecord(response) && response['hasQueuedPrompt'] === false
+        ? 'clear'
+        : isRecord(response) && response['hasQueuedPrompt'] === true
+          ? 'queued'
+          : 'unavailable';
+    } catch {
+      return 'unavailable';
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  #scheduleAutomaticBoundaryWatchdog(ownerPromptId: string): void {
+    if (this.disposed || this.closing) return;
+    if (
+      this.automaticBoundaryWatchdog &&
+      this.automaticBoundaryWatchdogOwner === ownerPromptId
+    ) {
+      return;
+    }
+    if (
+      this.automaticBoundaryWatchdogOwner !== undefined &&
+      this.automaticBoundaryWatchdogOwner !== ownerPromptId
+    ) {
+      this.#clearAutomaticBoundaryWatchdog();
+    }
+    this.automaticBoundaryWatchdogOwner = ownerPromptId;
+    const delay = Math.min(
+      5_000,
+      250 * 2 ** Math.min(this.automaticBoundaryWatchdogAttempt, 5),
+    );
+    this.automaticBoundaryWatchdog = setTimeout(() => {
+      this.automaticBoundaryWatchdog = undefined;
+      void this.#runAutomaticBoundaryWatchdog(ownerPromptId);
+    }, delay);
+    this.automaticBoundaryWatchdog.unref?.();
+  }
+
+  async #runAutomaticBoundaryWatchdog(ownerPromptId: string): Promise<void> {
+    if (this.automaticBoundaryWatchdogOwner !== ownerPromptId) {
+      return;
+    }
+    if (
+      this.disposed ||
+      this.closing ||
+      this.deferredAutomaticBoundary?.ownerPromptId !== ownerPromptId
+    ) {
+      this.#clearAutomaticBoundaryWatchdog(ownerPromptId);
+      return;
+    }
+    const inspection = await this.#inspectRemoteTurnBoundary(ownerPromptId);
+    if (this.automaticBoundaryWatchdogOwner !== ownerPromptId) return;
+    if (
+      this.disposed ||
+      this.closing ||
+      this.deferredAutomaticBoundary?.ownerPromptId !== ownerPromptId
+    ) {
+      this.#clearAutomaticBoundaryWatchdog(ownerPromptId);
+      return;
+    }
+    if (inspection === 'clear') {
+      this.#consumeDeferredAutomaticBoundary(ownerPromptId);
+      return;
+    }
+    this.automaticBoundaryWatchdogAttempt += 1;
+    this.#scheduleAutomaticBoundaryWatchdog(ownerPromptId);
+  }
+
+  #recordDeferredAutomaticBoundary(
+    ownerPromptId: string,
+    followupResult?: PromptResponse,
+  ): boolean {
+    if (this.automaticBoundaryReleasedBeforeRecord.delete(ownerPromptId)) {
+      return false;
+    }
+    this.deferredAutomaticBoundary = {
+      ownerPromptId,
+      ...(followupResult ? { followupResult } : {}),
+    };
+    if (this.promptQueueCoordinator?.inspectRemoteQueue) {
+      this.#scheduleAutomaticBoundaryWatchdog(ownerPromptId);
+    }
     return true;
   }
 
@@ -2429,6 +2612,10 @@ export class Session implements SessionContext {
     }
     let timeoutHandle: NodeJS.Timeout | undefined;
     try {
+      if (ownerPromptId && this.promptQueueCoordinator?.hasQueuedPrompt()) {
+        this.#awaitTodoStopGuardQueuedPrompt(ownerPromptId);
+        return 'queued';
+      }
       const claimPromise = this.client.extMethod(
         TODO_STOP_GUARD_CONTINUATION_CLAIM_METHOD,
         {
@@ -2884,11 +3071,14 @@ export class Session implements SessionContext {
     return this.config;
   }
 
-  async assertCanStartTurn(): Promise<void> {
+  async assertCanStartTurn(historyMutationOwner?: () => void): Promise<void> {
     if (this.closing) {
       throw RequestError.invalidParams(undefined, 'Session is closing');
     }
-    if (this.historyMutationActive) {
+    if (
+      this.historyMutationOwner &&
+      this.historyMutationOwner !== historyMutationOwner
+    ) {
       throw RequestError.invalidParams(
         undefined,
         'Session history mutation is in progress',
@@ -2907,7 +3097,10 @@ export class Session implements SessionContext {
     if (this.closing) {
       throw RequestError.invalidParams(undefined, 'Session is closing');
     }
-    if (this.historyMutationActive) {
+    if (
+      this.historyMutationOwner &&
+      this.historyMutationOwner !== historyMutationOwner
+    ) {
       throw RequestError.invalidParams(
         undefined,
         'Session history mutation is in progress',
@@ -2981,7 +3174,8 @@ export class Session implements SessionContext {
   #hasActiveTurn(): boolean {
     return Boolean(
       this.pendingPrompt ||
-        this.historyMutationActive ||
+        this.promptInvocationOwner ||
+        this.historyMutationOwner ||
         this.pendingPromptCompletion ||
         this.goalProcessing ||
         this.cronProcessing ||
@@ -2993,6 +3187,24 @@ export class Session implements SessionContext {
     );
   }
 
+  #hasActiveTurnExcludingHistoryMutation(): boolean {
+    return Boolean(
+      this.pendingPrompt ||
+        this.promptInvocationOwner ||
+        this.pendingPromptCompletion ||
+        this.cronProcessing ||
+        this.cronAbortController ||
+        this.cronCompletion ||
+        this.notificationProcessing ||
+        this.notificationAbortController ||
+        this.notificationCompletion,
+    );
+  }
+
+  hasHistoryMutationOwner(): boolean {
+    return this.historyMutationOwner !== undefined;
+  }
+
   beginHistoryMutation(): () => void {
     if (this.closing) {
       throw RequestError.invalidParams(undefined, 'Session is closing');
@@ -3002,18 +3214,19 @@ export class Session implements SessionContext {
         errorKind: 'session_busy',
       });
     }
-    this.historyMutationActive = true;
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
       released = true;
-      this.historyMutationActive = false;
+      if (this.historyMutationOwner !== release) return;
+      this.historyMutationOwner = undefined;
       if (this.disposed) return;
       void this.#drainCronQueue();
       void this.#drainNotificationQueue();
     };
+    this.historyMutationOwner = release;
+    return release;
   }
-
   beginClose(): () => void {
     if (this.closing) {
       throw RequestError.invalidParams(
@@ -3103,6 +3316,9 @@ export class Session implements SessionContext {
   dispose(): void {
     this.disposed = true;
     this.closing = true;
+    this.deferredAutomaticBoundary = undefined;
+    this.automaticBoundaryReleasedBeforeRecord.clear();
+    this.#clearAutomaticBoundaryWatchdog();
     this.pendingPrompt?.abort(SESSION_DISPOSE_ABORT_REASON);
     this.pendingPrompt = null;
     this.resolveCloseGate?.();
@@ -3225,6 +3441,7 @@ export class Session implements SessionContext {
   rewindToTurn(
     targetTurnIndex: number,
     opts?: { rewindFiles?: boolean },
+    historyMutationOwner?: () => void,
   ): {
     targetTurnIndex: number;
     apiTruncateIndex: number;
@@ -3236,10 +3453,19 @@ export class Session implements SessionContext {
       );
     }
 
-    if (this.closing || this.#hasActiveTurn()) {
+    if (this.closing || this.#hasActiveTurnExcludingHistoryMutation()) {
       throw RequestError.invalidParams(
         undefined,
         'Cannot rewind while a prompt is running',
+      );
+    }
+    if (
+      historyMutationOwner === undefined ||
+      this.historyMutationOwner !== historyMutationOwner
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'History mutation requires its active owner token',
       );
     }
 
@@ -3297,6 +3523,21 @@ export class Session implements SessionContext {
     return this.config.getGeminiClient()!.getChat().getHistoryShallow();
   }
 
+  captureHistorySnapshotForMutation(
+    historyMutationOwner: () => void,
+  ): Content[] {
+    if (
+      historyMutationOwner === undefined ||
+      this.historyMutationOwner !== historyMutationOwner
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'History snapshot requires its active owner token',
+      );
+    }
+    return this.captureHistorySnapshot();
+  }
+
   getRewindableUserTurnCount(): number {
     const apiHistory = this.captureHistorySnapshot();
     const startIndex = getStartupContextLength(apiHistory, {
@@ -3313,14 +3554,22 @@ export class Session implements SessionContext {
     return count;
   }
 
-  restoreHistory(history: Content[]): void {
-    if (this.closing || this.#hasActiveTurn()) {
+  restoreHistory(history: Content[], historyMutationOwner?: () => void): void {
+    if (this.closing || this.#hasActiveTurnExcludingHistoryMutation()) {
       throw RequestError.invalidParams(
         undefined,
         'Cannot restore history while a prompt is running',
       );
     }
-
+    if (
+      historyMutationOwner === undefined ||
+      this.historyMutationOwner !== historyMutationOwner
+    ) {
+      throw RequestError.invalidParams(
+        undefined,
+        'History mutation requires its active owner token',
+      );
+    }
     this.config
       .getGeminiClient()!
       .getChat()
@@ -3477,7 +3726,7 @@ export class Session implements SessionContext {
     if (this.closing) {
       throw RequestError.invalidParams(undefined, 'Session is closing');
     }
-    if (this.historyMutationActive) {
+    if (this.historyMutationOwner) {
       throw RequestError.invalidParams(
         undefined,
         'Session history mutation is in progress',
@@ -3495,60 +3744,69 @@ export class Session implements SessionContext {
         'Invalid trusted model-only prompt',
       );
     }
-    await this.assertCanStartTurn();
-    if (
-      this.liveScreenContextTool ||
-      this.liveTaskTools.length > 0 ||
-      this.liveSpeakToUserTool
-    ) {
-      await this.#syncLiveToolDeclarations();
-    }
-    if (this.closing) {
-      throw RequestError.invalidParams(undefined, 'Session is closing');
-    }
-    if (this.historyMutationActive) {
-      throw RequestError.invalidParams(
-        undefined,
-        'Session history mutation is in progress',
-      );
-    }
-    if (admissionCancellation?.aborted) {
-      return { stopReason: 'cancelled' };
-    }
-    const todoStopGuardPreparation =
-      this.#prepareTodoStopGuardForPrompt(params);
     let goalTurn = scheduledGoalTurn;
     let reservedGoalRuntime: GoalRuntime | undefined;
     let reservedGoalTurnKey: string | undefined;
-    if (!goalTurn) {
+    let goalTurnHandled = false;
+    const reserveGoalTurn = async (): Promise<void> => {
+      if (goalTurn || reservedGoalRuntime) return;
       try {
         const runtime = this.config.getGoalRuntime();
-        if (runtime.getSnapshot().goal?.status === 'active') {
-          reservedGoalRuntime = runtime;
-          reservedGoalTurnKey = `goal-user:${randomUUID()}`;
-          runtime.beginTurn(reservedGoalTurnKey);
-          // A runtime continuation that is queued but has not started yet
-          // holds the runtime's permit, and `#drainGoalQueue` is gated on
-          // this prompt's `pendingPrompt`: the drain cannot start the
-          // continuation until we finish, and we cannot start until its
-          // permit is free. Drop it the way an arriving prompt already drops
-          // queued cron and notification work -- the release above promotes
-          // the reservation, and the runtime mints a fresh continuation once
-          // this prompt settles.
-          for (const queued of this.goalQueue.splice(0)) {
-            queued.controller.abort(NEW_PROMPT_ABORT_REASON);
-            await runtime.releaseTurn(queued.turnKey);
-          }
+        if (runtime.getSnapshot().goal?.status !== 'active') return;
+        const turnKey = `goal-user:${randomUUID()}`;
+        runtime.beginTurn(turnKey);
+        reservedGoalRuntime = runtime;
+        reservedGoalTurnKey = turnKey;
+        // A queued runtime continuation holds the Goal permit while this
+        // prompt prevents its drain. Release it so this user turn can claim
+        // the reservation; the runtime will schedule a fresh continuation
+        // after this turn settles.
+        for (const queued of this.goalQueue.splice(0)) {
+          queued.controller.abort(NEW_PROMPT_ABORT_REASON);
+          await runtime.releaseTurn(queued.turnKey);
         }
       } catch (error) {
         if (!(error instanceof GoalPersistenceUnavailableError)) throw error;
       }
+    };
+    if (this.promptInvocationOwner) {
+      const activeGoalTurn = this.activeGoalTurn;
+      const activeInvocationCompletion = this.promptInvocationCompletion;
+      if (
+        scheduledGoalTurn === undefined &&
+        activeGoalTurn !== undefined &&
+        activeInvocationCompletion !== null
+      ) {
+        await reserveGoalTurn();
+        activeGoalTurn.controller.abort(NEW_PROMPT_ABORT_REASON);
+        await activeInvocationCompletion;
+      }
+      if (this.promptInvocationOwner) {
+        if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          goalTurnHandled = true;
+        }
+        throw new RequestError(
+          -32603,
+          'Concurrent Session.prompt invocation bypassed the prompt queue',
+          { errorKind: 'prompt_executor_busy' },
+        );
+      }
     }
-    // After writer admission, install this prompt's AbortController before
-    // awaiting the previous prompt so a session/cancel during that wait
-    // targets us. A cancel during admission cannot target this pending prompt.
-    this.pendingPrompt?.abort(NEW_PROMPT_ABORT_REASON);
-    const pendingSend = goalTurn?.controller ?? new AbortController();
+    const promptInvocationOwner = {};
+    let resolvePromptInvocation!: () => void;
+    this.promptInvocationOwner = promptInvocationOwner;
+    this.promptInvocationCompletion = new Promise<void>((resolve) => {
+      resolvePromptInvocation = resolve;
+    });
+    this.promptInvocationOwnerPromptId =
+      invocationContext?.sessionId === this.sessionId
+        ? invocationContext.promptId
+        : undefined;
+    // Attach the queue-owned cancellation signal before writer admission,
+    // which may wait on another process. A cancelled queued prompt must not
+    // begin execution after that wait eventually succeeds.
+    const pendingSend = scheduledGoalTurn?.controller ?? new AbortController();
     const cancelPendingSend = () => pendingSend.abort(USER_CANCEL_ABORT_REASON);
     if (admissionCancellation) {
       admissionCancellation.addEventListener('abort', cancelPendingSend, {
@@ -3556,274 +3814,366 @@ export class Session implements SessionContext {
       });
       if (admissionCancellation.aborted) cancelPendingSend();
     }
-    this.pendingPrompt = pendingSend;
-    const releasePendingSend = () => {
+    try {
+      if (pendingSend.signal.aborted) {
+        if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          goalTurnHandled = true;
+        }
+        this.todoStopGuard.suspend();
+        return { stopReason: 'cancelled' };
+      }
+      await this.assertCanStartTurn();
+      if (
+        this.liveScreenContextTool ||
+        this.liveTaskTools.length > 0 ||
+        this.liveSpeakToUserTool
+      ) {
+        await this.#syncLiveToolDeclarations();
+      }
+      if (this.closing) {
+        throw RequestError.invalidParams(undefined, 'Session is closing');
+      }
+      if (this.historyMutationOwner) {
+        throw RequestError.invalidParams(
+          undefined,
+          'Session history mutation is in progress',
+        );
+      }
+      if (pendingSend.signal.aborted) {
+        if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          goalTurnHandled = true;
+        }
+        this.todoStopGuard.suspend();
+        return { stopReason: 'cancelled' };
+      }
+      const todoStopGuardPreparation =
+        this.#prepareTodoStopGuardForPrompt(params);
+      await reserveGoalTurn();
+      // The queue owner has already serialized this call. This controller is
+      // execution-local: a later prompt must never abort or replace it.
+      this.pendingPrompt = pendingSend;
+      const releasePendingSend = () => {
+        admissionCancellation?.removeEventListener('abort', cancelPendingSend);
+        if (this.pendingPrompt === pendingSend) {
+          this.pendingPrompt = null;
+        }
+      };
+
+      // A fresh prompt makes any in-flight suggestion stale.
+      if (this.followupAbort) {
+        this.followupAbort.abort();
+        this.followupAbort = null;
+      }
+      // Abort any in-progress cron execution (user prompt takes priority)
+      if (this.cronAbortController) {
+        this.cronAbortController.abort();
+        this.cronAbortController = null;
+        this.cronQueue = [];
+        this.cronProcessing = false;
+      }
+      if (this.cronCompletion) {
+        try {
+          await this.cronCompletion;
+        } catch {
+          // Expected: cron was aborted
+        }
+        this.cronCompletion = null;
+      }
+
+      // A background notification turn mutates the same chat history as a user
+      // prompt. Abort it before awaiting the drain so user input is not blocked
+      // behind notification tool calls.
+      if (this.notificationAbortController) {
+        this.notificationAbortController.abort();
+        this.notificationAbortController = null;
+        this.notificationQueue = [];
+        this.notificationProcessing = false;
+      }
+      if (this.notificationCompletion) {
+        try {
+          await this.notificationCompletion;
+        } catch {
+          // Notification errors are surfaced through the session stream.
+        }
+      }
+
+      if (reservedGoalRuntime && reservedGoalTurnKey) {
+        try {
+          const permit = await claimGoalTurn(
+            reservedGoalRuntime,
+            reservedGoalTurnKey,
+            pendingSend.signal,
+          );
+          if (permit) {
+            const goal = reservedGoalRuntime.getSnapshot().goal;
+            if (goal) {
+              const verifierFeedback =
+                reservedGoalRuntime.getVerifierFeedback(permit);
+              goalTurn = {
+                permit,
+                turnKey: reservedGoalTurnKey,
+                controller: pendingSend,
+                origin: 'user',
+                continuationContext: goal.objective,
+                ...(verifierFeedback ? { verifierFeedback } : {}),
+                modelStarted: false,
+              };
+            }
+          }
+        } catch (error) {
+          try {
+            await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          } catch (releaseError) {
+            debugLogger.warn(
+              `Failed to release Goal reservation after admission failure: ${
+                releaseError instanceof Error
+                  ? releaseError.message
+                  : String(releaseError)
+              }`,
+            );
+          } finally {
+            goalTurnHandled = true;
+            releasePendingSend();
+            this.todoStopGuard.suspend();
+          }
+          throw error;
+        }
+      }
+
+      // Cancelled while waiting for a background notification turn to settle.
+      if (pendingSend.signal.aborted) {
+        if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          goalTurnHandled = true;
+        }
+        releasePendingSend();
+        this.todoStopGuard.suspend();
+        return { stopReason: 'cancelled' };
+      }
+
+      this.#clearDeferredAutomaticBoundaryForSuccessor();
+
+      if (todoStopGuardPreparation.startsWorkChain) {
+        this.#clearTodoStopGuardQueuedPromptWait();
+        this.todoStopGuard.startOrdinaryPrompt();
+        this.#resetTodoStopGuardBackgroundLineage();
+      }
+
+      this.duplicateProviderToolCallResponseIds.clear();
+      const channelDelivery = parsePromptChannelDelivery(params);
+      const responseCapture: AgentResponseCapture = {
+        ...(channelDelivery ? { channelDelivery: { finalText: '' } } : {}),
+        agentOutput: new AgentOutputMessageCapture(this.config),
+      };
+      const channelPromptTurn =
+        (params as { _meta?: Record<string, unknown> })._meta?.[
+          CHANNEL_PROMPT_META_KEY
+        ] === true;
+      const recording = this.config.getChatRecordingService();
+      const branchCheckpointCursor =
+        scheduledGoalTurn === undefined && !channelPromptTurn
+          ? recording?.getBranchCheckpointCursor()
+          : undefined;
+      // One server-side channel classification, consumed by both the
+      // rejection gate below and the guard-mode selection in
+      // #executePromptInner. Only the authenticated channel-prompt marker
+      // classifies a turn: the delivery meta is a caller-requested side
+      // effect (the response is still delivered on end_turn below), and
+      // letting it classify would let any caller opt its own turn out of
+      // loop-detected rejection and the repeated-failure guard. The ACP
+      // boundary strips the channel-prompt key from untrusted callers, so
+      // both decisions see only trusted values.
+
+      // Track this prompt's completion for the next prompt to await
+      let resolveCompletion!: () => void;
+      this.pendingPromptCompletion = new Promise<void>((resolve) => {
+        resolveCompletion = resolve;
+      });
+      const automaticBoundaryOwnerPromptId = invocationContext?.promptId;
+      let automaticBoundaryChecked = false;
+      let automaticBoundaryDeferred = false;
+      let rejectedByLoopProtection = false;
+      let promptResult: PromptResponse | undefined;
+      let promptFailed = false;
+
+      try {
+        const result = await this.#executePrompt(
+          params,
+          pendingSend,
+          responseCapture,
+          invocationContext,
+          modelPrompt,
+          // Channel turns are non-interactive deliveries: like cron,
+          // background-notification, and goal turns they keep the graceful
+          // end-turn handling so the collected response text is still
+          // delivered. Only the authenticated CHANNEL_PROMPT_META_KEY turns
+          // sent by the channel bridges qualify; the delivery meta alone
+          // schedules the delivery but keeps the foreground rejection. Goal
+          // turns bypass the bridge entirely, so a rejection there would
+          // settle the turn as failed and pause the goal without any
+          // turn_error ever being published.
+          !channelPromptTurn && goalTurn === undefined,
+          goalTurn,
+          channelPromptTurn,
+        );
+        let branchPoint: BranchPoint | undefined;
+        if (recording && branchCheckpointCursor) {
+          try {
+            branchPoint = await recording.recordBranchCheckpointTransaction({
+              cursor: branchCheckpointCursor,
+              stopReason: result.stopReason,
+            });
+          } catch (error) {
+            debugLogger.warn(
+              'Failed to record branch checkpoint; completing the turn without a branch point',
+              error,
+            );
+          }
+        }
+        const completedResult: PromptResponse = branchPoint
+          ? {
+              ...result,
+              _meta: {
+                ...result._meta,
+                'qwen.branchPoint': {
+                  assistantRecordUuid: branchPoint.assistantRecordUuid,
+                  checkpointUuid: branchPoint.checkpointUuid,
+                },
+              },
+            }
+          : result;
+        promptResult = completedResult;
+        if (automaticBoundaryOwnerPromptId) {
+          const inspection = await this.#inspectTurnBoundary(
+            automaticBoundaryOwnerPromptId,
+          );
+          automaticBoundaryChecked = true;
+          if (inspection !== 'clear') {
+            automaticBoundaryDeferred = this.#recordDeferredAutomaticBoundary(
+              automaticBoundaryOwnerPromptId,
+              completedResult,
+            );
+          }
+        }
+        releasePendingSend();
+        if (!automaticBoundaryDeferred) {
+          // Drain any cron prompts that queued while the prompt was active.
+          void this.#drainCronQueue();
+          void this.#drainNotificationQueue();
+          this.#maybeEmitFollowupSuggestion(completedResult);
+        }
+        if (channelDelivery && completedResult.stopReason === 'end_turn') {
+          this.#scheduleChannelDelivery({
+            sessionId: this.sessionId,
+            deliveryId: channelDelivery.deliveryId,
+            source: 'prompt',
+            target: channelDelivery.target,
+            text: normalizeChannelDeliveryText(
+              responseCapture.channelDelivery?.finalText ?? '',
+            ),
+            promptId: channelDelivery.deliveryId,
+          });
+        }
+        return completedResult;
+      } catch (error) {
+        promptFailed = true;
+        if (error instanceof SessionWriterError) {
+          throw new RequestError(error.rpcCode, error.message, {
+            errorKind: error.errorKind,
+          });
+        }
+        rejectedByLoopProtection = isLoopDetectedTurnError(error);
+        throw error;
+      } finally {
+        const stillOwnsPendingPrompt = this.pendingPrompt === pendingSend;
+        releasePendingSend();
+        if (automaticBoundaryOwnerPromptId && !automaticBoundaryChecked) {
+          const inspection = await this.#inspectTurnBoundary(
+            automaticBoundaryOwnerPromptId,
+          );
+          automaticBoundaryChecked = true;
+          if (inspection !== 'clear') {
+            automaticBoundaryDeferred = this.#recordDeferredAutomaticBoundary(
+              automaticBoundaryOwnerPromptId,
+            );
+          }
+        }
+        if (
+          automaticBoundaryOwnerPromptId &&
+          this.deferredAutomaticBoundary?.ownerPromptId ===
+            automaticBoundaryOwnerPromptId &&
+          this.deferredAutomaticBoundary.released
+        ) {
+          this.#consumeDeferredAutomaticBoundary(
+            automaticBoundaryOwnerPromptId,
+          );
+          automaticBoundaryDeferred = false;
+        }
+        const shouldDrainAutomaticQueues =
+          // Loop-detected turns resolved end_turn (and drained) before loop
+          // stops became rejections; keep that invariant on the new path so
+          // queued cron/notification work is not stranded.
+          rejectedByLoopProtection ||
+          todoStopGuardPreparation.drainSupersededAutomaticQueues ||
+          this.todoStopGuardDrainAutomaticQueuesWhenIdle ||
+          this.todoStopGuard.blocksUnrelatedAutomaticTurns ||
+          this.todoStopGuard.hasCommittedContinuation ||
+          this.todoStopGuardQueuedPromptPriority;
+        if (stillOwnsPendingPrompt) {
+          this.todoStopGuardDrainAutomaticQueuesWhenIdle = false;
+        }
+        if (shouldDrainAutomaticQueues && !automaticBoundaryDeferred) {
+          void this.#drainCronQueue();
+          void this.#drainNotificationQueue();
+        }
+        if (goalTurn) {
+          await this.#settleGoalTurn(goalTurn, promptResult, promptFailed);
+          goalTurnHandled = true;
+        } else if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+          goalTurnHandled = true;
+        }
+        // Start the scheduler in finally, not the success path: a turn can arm
+        // a wakeup via LoopWakeup and then throw on a later step. Gated on
+        // hasPendingWork/disposed/disabled, so it only starts when a wakeup (or
+        // cron job) is actually pending — otherwise the loop dies silently on
+        // any post-arm error.
+        if (!automaticBoundaryDeferred) {
+          void this.#startCronSchedulerInRuntime();
+        }
+        resolveCompletion();
+        this.pendingPromptCompletion = null;
+        await this.#consumeLiveEndInstruction();
+      }
+    } finally {
+      if (!goalTurnHandled) {
+        if (goalTurn) {
+          await this.#settleGoalTurn(goalTurn, undefined, true);
+        } else if (reservedGoalRuntime && reservedGoalTurnKey) {
+          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
+        }
+        goalTurnHandled = true;
+      }
       admissionCancellation?.removeEventListener('abort', cancelPendingSend);
       if (this.pendingPrompt === pendingSend) {
         this.pendingPrompt = null;
       }
-    };
-
-    // Abort the previous turn's in-flight follow-up suggestion
-    // generation (if any). Mirrors `pendingPrompt?.abort()` above —
-    // a fresh prompt arriving means any pending suggestion would be
-    // stale before it could ever render.
-    if (this.followupAbort) {
-      this.followupAbort.abort();
-      this.followupAbort = null;
-    }
-    // Abort any in-progress cron execution (user prompt takes priority)
-    if (this.cronAbortController) {
-      this.cronAbortController.abort();
-      this.cronAbortController = null;
-      this.cronQueue = [];
-      this.cronProcessing = false;
-    }
-    if (this.cronCompletion) {
-      try {
-        await this.cronCompletion;
-      } catch {
-        // Expected: cron was aborted
-      }
-      this.cronCompletion = null;
-    }
-
-    // Wait for the previous prompt to finish so chat history is consistent.
-    if (this.pendingPromptCompletion) {
-      try {
-        await this.pendingPromptCompletion;
-      } catch {
-        // Expected: previous prompt was cancelled or errored
-      }
-    }
-
-    // A background notification turn mutates the same chat history as a user
-    // prompt. Abort it before awaiting the drain so user input is not blocked
-    // behind notification tool calls.
-    if (this.notificationAbortController) {
-      this.notificationAbortController.abort();
-      this.notificationAbortController = null;
-      this.notificationQueue = [];
-      this.notificationProcessing = false;
-    }
-    if (this.notificationCompletion) {
-      try {
-        await this.notificationCompletion;
-      } catch {
-        // Notification errors are surfaced through the session stream.
-      }
-    }
-
-    if (reservedGoalRuntime && reservedGoalTurnKey) {
-      try {
-        const permit = await claimGoalTurn(
-          reservedGoalRuntime,
-          reservedGoalTurnKey,
-          pendingSend.signal,
-        );
-        if (permit) {
-          const goal = reservedGoalRuntime.getSnapshot().goal;
-          if (goal) {
-            const verifierFeedback =
-              reservedGoalRuntime.getVerifierFeedback(permit);
-            goalTurn = {
-              permit,
-              turnKey: reservedGoalTurnKey,
-              controller: pendingSend,
-              origin: 'user',
-              continuationContext: goal.objective,
-              ...(verifierFeedback ? { verifierFeedback } : {}),
-              modelStarted: false,
-            };
-          }
-        }
-      } catch (error) {
-        try {
-          await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
-        } catch (releaseError) {
-          debugLogger.warn(
-            `Failed to release Goal reservation after admission failure: ${
-              releaseError instanceof Error
-                ? releaseError.message
-                : String(releaseError)
-            }`,
-          );
-        } finally {
-          releasePendingSend();
-          this.todoStopGuard.suspend();
-        }
-        throw error;
-      }
-    }
-
-    // Cancelled while waiting for the previous prompt to finish.
-    if (pendingSend.signal.aborted) {
-      // Release whether or not the claim got as far as building `goalTurn`.
-      // `claimGoalTurn` refuses an already-aborted signal, but the abort can
-      // land in the microtask gap between it resolving with a permit and the
-      // check here — and on that path the old `!goalTurn` guard skipped the
-      // release, so the permit was held by a turn that returns `cancelled`
-      // without ever running. The runtime then stays `running` forever and
-      // every later goal turn blocks behind it. Releasing an unclaimed
-      // reservation is a no-op, so the wider guard costs nothing.
-      if (reservedGoalRuntime && reservedGoalTurnKey) {
-        await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
-      }
-      releasePendingSend();
-      this.todoStopGuard.suspend();
-      return { stopReason: 'cancelled' };
-    }
-
-    const channelPromptTurn =
-      (params as { _meta?: Record<string, unknown> })._meta?.[
-        CHANNEL_PROMPT_META_KEY
-      ] === true;
-    const recording = this.config.getChatRecordingService();
-    const branchCheckpointCursor =
-      scheduledGoalTurn === undefined && !channelPromptTurn
-        ? recording?.getBranchCheckpointCursor()
-        : undefined;
-
-    if (todoStopGuardPreparation.startsWorkChain) {
-      this.#clearTodoStopGuardQueuedPromptWait();
-      this.todoStopGuard.startOrdinaryPrompt();
-      this.#resetTodoStopGuardBackgroundLineage();
-    }
-
-    this.duplicateProviderToolCallResponseIds.clear();
-    const channelDelivery = parsePromptChannelDelivery(params);
-    const responseCapture: AgentResponseCapture = {
-      ...(channelDelivery ? { channelDelivery: { finalText: '' } } : {}),
-      agentOutput: new AgentOutputMessageCapture(this.config),
-    };
-    // One server-side channel classification, consumed by both the
-    // rejection gate below and the guard-mode selection in
-    // #executePromptInner. Only the authenticated channel-prompt marker
-    // classifies a turn: the delivery meta is a caller-requested side
-    // effect (the response is still delivered on end_turn below), and
-    // letting it classify would let any caller opt its own turn out of
-    // loop-detected rejection and the repeated-failure guard. The ACP
-    // boundary strips the channel-prompt key from untrusted callers, so
-    // both decisions see only trusted values.
-
-    // Track this prompt's completion for the next prompt to await
-    let resolveCompletion!: () => void;
-    this.pendingPromptCompletion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
-
-    let rejectedByLoopProtection = false;
-    let promptResult: PromptResponse | undefined;
-    let promptFailed = false;
-    try {
-      const result = await this.#executePrompt(
-        params,
-        pendingSend,
-        responseCapture,
-        invocationContext,
-        modelPrompt,
-        // Channel turns are non-interactive deliveries: like cron,
-        // background-notification, and goal turns they keep the graceful
-        // end-turn handling so the collected response text is still
-        // delivered. Only the authenticated CHANNEL_PROMPT_META_KEY turns
-        // sent by the channel bridges qualify; the delivery meta alone
-        // schedules the delivery but keeps the foreground rejection. Goal
-        // turns bypass the bridge entirely, so a rejection there would
-        // settle the turn as failed and pause the goal without any
-        // turn_error ever being published.
-        !channelPromptTurn && goalTurn === undefined,
-        goalTurn,
-        channelPromptTurn,
-      );
-      let branchPoint: BranchPoint | undefined;
-      if (recording && branchCheckpointCursor) {
-        try {
-          branchPoint = await recording.recordBranchCheckpointTransaction({
-            cursor: branchCheckpointCursor,
-            stopReason: result.stopReason,
-          });
-        } catch (error) {
-          debugLogger.warn(
-            'Failed to record branch checkpoint; completing the turn without a branch point',
-            error,
+      if (this.promptInvocationOwner === promptInvocationOwner) {
+        if (this.promptInvocationOwnerPromptId) {
+          this.automaticBoundaryReleasedBeforeRecord.delete(
+            this.promptInvocationOwnerPromptId,
           );
         }
+        this.promptInvocationOwner = undefined;
+        this.promptInvocationCompletion = null;
+        this.promptInvocationOwnerPromptId = undefined;
+        resolvePromptInvocation();
       }
-      const completedResult: PromptResponse = branchPoint
-        ? {
-            ...result,
-            _meta: {
-              ...result._meta,
-              'qwen.branchPoint': {
-                assistantRecordUuid: branchPoint.assistantRecordUuid,
-                checkpointUuid: branchPoint.checkpointUuid,
-              },
-            },
-          }
-        : result;
-      promptResult = completedResult;
-      releasePendingSend();
-      // Drain any cron prompts that queued while the prompt was active
-      void this.#drainCronQueue();
-      void this.#drainNotificationQueue();
-      this.#maybeEmitFollowupSuggestion(completedResult);
-      if (channelDelivery && completedResult.stopReason === 'end_turn') {
-        this.#scheduleChannelDelivery({
-          sessionId: this.sessionId,
-          deliveryId: channelDelivery.deliveryId,
-          source: 'prompt',
-          target: channelDelivery.target,
-          text: normalizeChannelDeliveryText(
-            responseCapture.channelDelivery?.finalText ?? '',
-          ),
-          promptId: channelDelivery.deliveryId,
-        });
+      if (!this.deferredAutomaticBoundary) {
+        void this.#drainGoalQueue();
       }
-      return completedResult;
-    } catch (error) {
-      promptFailed = true;
-      if (error instanceof SessionWriterError) {
-        throw new RequestError(error.rpcCode, error.message, {
-          errorKind: error.errorKind,
-        });
-      }
-      rejectedByLoopProtection = isLoopDetectedTurnError(error);
-      throw error;
-    } finally {
-      const stillOwnsPendingPrompt = this.pendingPrompt === pendingSend;
-      releasePendingSend();
-      const shouldDrainAutomaticQueues =
-        // Loop-detected turns resolved end_turn (and drained) before loop
-        // stops became rejections; keep that invariant on the new path so
-        // queued cron/notification work is not stranded.
-        rejectedByLoopProtection ||
-        todoStopGuardPreparation.drainSupersededAutomaticQueues ||
-        this.todoStopGuardDrainAutomaticQueuesWhenIdle ||
-        this.todoStopGuard.blocksUnrelatedAutomaticTurns ||
-        this.todoStopGuard.hasCommittedContinuation ||
-        this.todoStopGuardQueuedPromptPriority;
-      if (stillOwnsPendingPrompt) {
-        this.todoStopGuardDrainAutomaticQueuesWhenIdle = false;
-      }
-      if (shouldDrainAutomaticQueues) {
-        void this.#drainCronQueue();
-        void this.#drainNotificationQueue();
-      }
-      if (goalTurn) {
-        await this.#settleGoalTurn(goalTurn, promptResult, promptFailed);
-      } else if (reservedGoalRuntime && reservedGoalTurnKey) {
-        await reservedGoalRuntime.releaseTurn(reservedGoalTurnKey);
-      }
-      // Start the scheduler in finally, not the success path: a turn can arm
-      // a wakeup via LoopWakeup and then throw on a later step. Gated on
-      // hasPendingWork/disposed/disabled, so it only starts when a wakeup (or
-      // cron job) is actually pending — otherwise the loop dies silently on
-      // any post-arm error.
-      void this.#startCronSchedulerInRuntime();
-      resolveCompletion();
-      this.pendingPromptCompletion = null;
-      void this.#drainGoalQueue();
-      await this.#consumeLiveEndInstruction();
     }
   }
 
@@ -6424,7 +6774,8 @@ export class Session implements SessionContext {
     if (this.midTurnDrainUnavailable) {
       return {
         parts: await this.#buildMidTurnParts(recovered, abortSignal, options),
-        hasQueuedPrompt: false,
+        hasQueuedPrompt:
+          this.promptQueueCoordinator?.hasQueuedPrompt() ?? false,
         reliable: false,
       };
     }
@@ -6463,7 +6814,8 @@ export class Session implements SessionContext {
           options,
         ),
         hasQueuedPrompt:
-          isRecord(response) && response['hasQueuedPrompt'] === true,
+          (isRecord(response) && response['hasQueuedPrompt'] === true) ||
+          (this.promptQueueCoordinator?.hasQueuedPrompt() ?? false),
         reliable,
       };
     } catch (error) {
@@ -6517,7 +6869,8 @@ export class Session implements SessionContext {
       // an EARLIER timeout so a transient stall never strands those messages.
       return {
         parts: await this.#buildMidTurnParts(recovered, abortSignal, options),
-        hasQueuedPrompt: false,
+        hasQueuedPrompt:
+          this.promptQueueCoordinator?.hasQueuedPrompt() ?? false,
         reliable: false,
       };
     }

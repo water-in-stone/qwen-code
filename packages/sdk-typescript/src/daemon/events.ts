@@ -993,21 +993,27 @@ export type DaemonMidTurnMessageInjectedEvent = DaemonEventEnvelope<
   DaemonMidTurnMessageInjectedData
 >;
 export interface DaemonPendingPromptAddedData {
+  version?: 1;
   sessionId: string;
   promptId: string;
+  clientPromptId?: string;
   text: string;
   queuedAt: number;
   [key: string]: unknown;
 }
 export interface DaemonPendingPromptStartedData {
+  version?: 1;
   sessionId: string;
   promptId: string;
+  clientPromptId?: string;
   text: string;
   [key: string]: unknown;
 }
 export interface DaemonPendingPromptCompletedData {
+  version?: 1;
   sessionId: string;
   promptId: string;
+  clientPromptId?: string;
   state: 'completed' | 'removed';
   [key: string]: unknown;
 }
@@ -2697,8 +2703,11 @@ function isPendingPromptAddedData(
 ): value is DaemonPendingPromptAddedData {
   return (
     isRecord(value) &&
+    (value['version'] === undefined || value['version'] === 1) &&
     isNonEmptyString(value['sessionId']) &&
     isNonEmptyString(value['promptId']) &&
+    (value['clientPromptId'] === undefined ||
+      isNonEmptyString(value['clientPromptId'])) &&
     typeof value['text'] === 'string' &&
     typeof value['queuedAt'] === 'number'
   );
@@ -2709,8 +2718,11 @@ function isPendingPromptStartedData(
 ): value is DaemonPendingPromptStartedData {
   return (
     isRecord(value) &&
+    (value['version'] === undefined || value['version'] === 1) &&
     isNonEmptyString(value['sessionId']) &&
     isNonEmptyString(value['promptId']) &&
+    (value['clientPromptId'] === undefined ||
+      isNonEmptyString(value['clientPromptId'])) &&
     typeof value['text'] === 'string'
   );
 }
@@ -2720,8 +2732,11 @@ function isPendingPromptCompletedData(
 ): value is DaemonPendingPromptCompletedData {
   return (
     isRecord(value) &&
+    (value['version'] === undefined || value['version'] === 1) &&
     isNonEmptyString(value['sessionId']) &&
     isNonEmptyString(value['promptId']) &&
+    (value['clientPromptId'] === undefined ||
+      isNonEmptyString(value['clientPromptId'])) &&
     (value['state'] === 'completed' || value['state'] === 'removed')
   );
 }

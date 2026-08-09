@@ -3427,9 +3427,9 @@ export function registerSessionRoutes(
         // The effective deadline (server cap ∩ request override) is passed
         // to the bridge, which owns the deadline race: it publishes the
         // formal `turn_error{code:'prompt_deadline_exceeded'}` terminal,
-        // releases the per-session FIFO, and best-effort cancels the agent.
-        // A route-side timer can't do any of that — it could only abort
-        // this request's signal.
+        // settles this caller, and best-effort cancels the agent while the
+        // child request retains the FIFO executor fence until it drains. A
+        // route-side timer cannot enforce those lifecycle guarantees.
         const effectiveDeadlineMs = resolvePromptDeadlineMs(
           promptDeadlineMs,
           requestDeadlineMs,

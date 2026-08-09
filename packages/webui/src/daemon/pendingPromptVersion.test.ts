@@ -113,6 +113,25 @@ describe('pending prompt sidechannel', () => {
     ).toBe(true);
   });
 
+  it('preserves versioned client correlation fields', async () => {
+    const sidechannel = await loadModule();
+    const event = {
+      v: 1 as const,
+      type: 'pending_prompt_added' as const,
+      data: {
+        version: 1 as const,
+        sessionId: 's-1',
+        promptId: 'p-1',
+        clientPromptId: 'client-1',
+        text: 'hello',
+        queuedAt: 1,
+      },
+    };
+
+    expect(sidechannel.publishPendingPromptEvent(event)).toBe(true);
+    expect(sidechannel.getPendingPromptEvents()).toEqual([event]);
+  });
+
   it('consume removes only handled event identities', async () => {
     const sidechannel = await loadModule();
     const first = pendingEvent('pending_prompt_added', 'p-1');

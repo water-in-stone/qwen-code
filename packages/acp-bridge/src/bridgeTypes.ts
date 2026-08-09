@@ -687,6 +687,8 @@ export interface BridgeClientRequestContext {
    * SSE event to the pending HTTP 202 request.
    */
   promptId?: string;
+  /** Opaque host correlation id validated at the ACP boundary. */
+  clientPromptId?: string;
   /**
    * Internal originator for a daemon-owned mid-turn message promoted into the
    * normal prompt FIFO. It was authenticated when the message was enqueued,
@@ -736,8 +738,10 @@ export interface BridgeClientRequestContext {
    * Absolute wallclock budget (ms) for this prompt, measured from admission
    * (the 202 semantic point) and covering queue wait. When exceeded, the
    * bridge publishes a `turn_error{code:'prompt_deadline_exceeded'}` terminal,
-   * releases the FIFO, and best-effort cancels the agent. Populated by the
-   * REST prompt route from `resolvePromptDeadlineMs(serverMs, requestMs)`.
+   * settles the caller, and best-effort cancels the agent. A dispatched child
+   * retains the FIFO executor fence until it settles or its transport closes.
+   * Populated by the REST prompt route from
+   * `resolvePromptDeadlineMs(serverMs, requestMs)`.
    */
   deadlineMs?: number;
 }
@@ -893,12 +897,22 @@ export interface BridgeMidTurnMessagesSnapshot {
  */
 export interface PendingPromptEntry {
   promptId: string;
+  clientPromptId?: string;
   queuedAt: number;
   originatorClientId?: string;
   promotedMidTurn?: true;
-  text: string;
+  text?: string;
+  /** Retained only until dispatch or visible retirement. */
+  request?: PromptRequest;
+  /** Trusted model-only content retained only until dispatch or retirement. */
+  modelPrompt?: string;
   abortController: AbortController;
   state: 'queued' | 'running';
+  wasQueued?: boolean;
+  queueRetired?: 'completed' | 'removed';
+  callerSettled?: boolean;
+  resolveCaller?: (response: PromptResponse) => void;
+  rejectCaller?: (reason: unknown) => void;
   /**
    * Exactly-once latch for the prompt's formal terminal event
    * (`turn_complete` / `turn_error`). Set by `publishPromptTerminal`;
@@ -929,6 +943,7 @@ export interface PendingPromptEntry {
  */
 export interface PendingPromptSummary {
   promptId: string;
+  clientPromptId?: string;
   text: string;
   queuedAt: number;
   state: 'queued' | 'running';

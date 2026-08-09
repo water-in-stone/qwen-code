@@ -5,6 +5,7 @@
  */
 
 import { loadSettings } from '../../config/settings.js';
+import { DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION } from '@qwen-code/acp-bridge/promptQueueProtocol';
 import { SUPPORTED_LANGUAGES } from '../../i18n/index.js';
 import { hasConfiguredBatchVoiceTranscriptionModel } from '../../services/voice-service.js';
 import { writeStderrLine } from '../../utils/stdioHelpers.js';
@@ -15,7 +16,6 @@ import type { ServeOptions } from '../types.js';
 
 // Keep in sync with acp-bridge bridge.ts and SDK DaemonClient.ts.
 const DEFAULT_MAX_SESSIONS = 32;
-const DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION = 5;
 
 export const SERVE_LANGUAGE_CODES = [
   ...SUPPORTED_LANGUAGES.map((language) => language.code),

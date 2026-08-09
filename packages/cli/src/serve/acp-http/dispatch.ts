@@ -25,6 +25,7 @@ import {
   type SubagentLevel,
   IMAGE_CAPABILITY,
 } from '@qwen-code/qwen-code-core';
+import { randomUUID } from 'node:crypto';
 // Import the permission error classes from the same module REST's
 // `sendPermissionVoteError` uses, so `instanceof` matches the class the bridge
 // actually throws (the core re-export is a distinct identity at runtime).
@@ -62,6 +63,15 @@ import {
   canonicalizeWorkspace,
 } from '@qwen-code/acp-bridge/workspacePaths';
 import type { BridgeEvent } from '@qwen-code/acp-bridge/eventBus';
+import {
+  addPromptQueueCapabilityToMeta,
+  InvalidPromptQueueMetadataError,
+  isValidPromptQueueServerId,
+  parseAndStripPromptQueueMetadata,
+  PROMPT_QUEUE_LIST_METHOD,
+  PROMPT_QUEUE_PROTOCOL_VERSION,
+  PROMPT_QUEUE_REMOVE_METHOD,
+} from '@qwen-code/acp-bridge/promptQueueProtocol';
 import {
   SessionNotFoundError,
   SessionShellClientRequiredError,
@@ -232,6 +242,8 @@ const INVALID_PERMISSION_OUTCOME_ERROR =
   '`outcome` must be `{ outcome: "cancelled" }` or `{ outcome: "selected", optionId: string }`';
 
 const ALL_QWEN_VENDOR_METHODS: readonly string[] = [
+  PROMPT_QUEUE_LIST_METHOD,
+  PROMPT_QUEUE_REMOVE_METHOD,
   `${QWEN_METHOD_NS}session/heartbeat`,
   `${QWEN_METHOD_NS}session/context`,
   `${QWEN_METHOD_NS}session/supported_commands`,
@@ -908,6 +920,7 @@ export function toRpcError(err: unknown): {
           sessionId: promptErr.sessionId,
           limit: promptErr.limit,
           pendingCount: promptErr.pendingCount,
+          retryable: true,
         },
       };
     }
@@ -1309,16 +1322,20 @@ export class AcpDispatcher {
         // Vendor extensions are advertised under `_meta` keyed by domain
         // (ACP convention, e.g. `_meta: { "zed.dev": … }`). Clients
         // feature-detect before calling `_qwen/…` methods.
-        _meta: {
-          [QWEN_META_KEY]: {
-            connectionId,
-            workspaceCwd: this.boundWorkspace,
-            methods: advertisedQwenVendorMethods(
-              this.sessionShellCommandEnabled,
-            ),
+        _meta: addPromptQueueCapabilityToMeta(
+          {
+            [QWEN_META_KEY]: {
+              connectionId,
+              workspaceCwd: this.boundWorkspace,
+              methods: advertisedQwenVendorMethods(
+                this.sessionShellCommandEnabled,
+              ),
+            },
+            imageCapability: IMAGE_CAPABILITY,
           },
-          imageCapability: IMAGE_CAPABILITY,
-        },
+          this.bridge.getDaemonStatusSnapshot().limits
+            .maxPendingPromptsPerSession,
+        ),
       },
     };
   }
@@ -2081,11 +2098,12 @@ export class AcpDispatcher {
                 closeSession,
               );
             } catch (err) {
-              const promptAbort = conn.sessions.get(sessionId)?.promptAbort;
+              const hasPromptRequest =
+                (conn.sessions.get(sessionId)?.promptRequests.size ?? 0) > 0;
               if (
                 err instanceof SessionArchivingError &&
                 err.lockKind === 'shared' &&
-                promptAbort !== undefined
+                hasPromptRequest
               ) {
                 await this.archiveCoordinator.runSharedMany(
                   [sessionId],
@@ -2185,10 +2203,6 @@ export class AcpDispatcher {
         case 'session/cancel': {
           const sessionId = String(params['sessionId'] ?? '');
           await this.withMutableOwned(conn, sessionId, id, async () => {
-            // Abort our local in-flight prompt controller too — cancelSession
-            // tells the agent to wind down, but the HTTP-side `sendPrompt`
-            // await must also be released so the session FIFO unblocks.
-            conn.sessions.get(sessionId)?.promptAbort?.abort();
             await this.bridge.cancelSession(
               sessionId,
               // Forward client-supplied cancel fields (reason/context) while
@@ -2674,6 +2688,70 @@ export class AcpDispatcher {
             this.sessionCtx(conn, sessionId, loopback),
           );
           this.replyConn(conn, id, result as unknown);
+          return;
+        }
+
+        case PROMPT_QUEUE_LIST_METHOD: {
+          const sessionId = String(params['sessionId'] ?? '');
+          if (!this.requireOwned(conn, sessionId, id)) return;
+          const pendingPrompts = this.bridge.getPendingPrompts(
+            sessionId,
+            this.sessionCtx(conn, sessionId, loopback),
+          );
+          this.replyConn(conn, id, {
+            version: PROMPT_QUEUE_PROTOCOL_VERSION,
+            pendingPrompts,
+          });
+          return;
+        }
+
+        case PROMPT_QUEUE_REMOVE_METHOD: {
+          const sessionId = String(params['sessionId'] ?? '');
+          await this.withMutableOwned(conn, sessionId, id, async () => {
+            const promptId = params['promptId'];
+            if (!isValidPromptQueueServerId(promptId)) {
+              if (id !== undefined) {
+                conn.sendConn(
+                  error(
+                    id,
+                    RPC.INVALID_PARAMS,
+                    '`promptId` must be a canonical UUID',
+                  ),
+                );
+              }
+              return;
+            }
+            const context = this.sessionCtx(conn, sessionId, loopback);
+            const target = this.bridge
+              .getPendingPrompts(sessionId, context)
+              .find((pending) => pending.promptId === promptId);
+            if (!target) {
+              this.replyConn(conn, id, {
+                removed: false,
+                reason: 'not_found',
+              });
+              return;
+            }
+            if (target.state !== 'queued') {
+              this.replyConn(conn, id, {
+                removed: false,
+                reason: 'already_started',
+              });
+              return;
+            }
+            const result = this.bridge.removePendingPrompt(
+              sessionId,
+              promptId,
+              context,
+            );
+            this.replyConn(
+              conn,
+              id,
+              result.removed
+                ? { removed: true }
+                : { removed: false, reason: 'not_found' },
+            );
+          });
           return;
         }
 
@@ -5205,33 +5283,51 @@ export class AcpDispatcher {
     params: Record<string, unknown>,
     fromLoopback: boolean,
   ): Promise<void> {
-    // Park the controller on the binding so `session/cancel` and
-    // session/connection teardown can abort an in-flight prompt — otherwise
-    // a disconnecting client leaves the agent running, burning model quota
-    // and holding the session's prompt FIFO.
     const binding = conn.getOrCreateSession(sessionId);
-    // Abort any prior in-flight prompt for this session before replacing the
-    // controller — two concurrent `session/prompt`s would otherwise orphan
-    // the first (it runs to completion in the bridge FIFO, burning quota,
-    // and `session/cancel` could only reach the latest controller).
-    binding.promptAbort?.abort();
+    const promptId = randomUUID();
     const abort = new AbortController();
-    binding.promptAbort = abort;
+    binding.promptRequests.set(promptId, { controller: abort, requestId: id });
     try {
+      const rawMeta = isObject(params['_meta']) ? params['_meta'] : undefined;
+      const { clientPromptId, meta } =
+        parseAndStripPromptQueueMetadata(rawMeta);
+      const sanitizedParams = { ...params };
+      if (meta) sanitizedParams['_meta'] = meta;
+      else delete sanitizedParams['_meta'];
       const result = await this.bridge.sendPrompt(
         sessionId,
-        // SECURITY NOTE: `params.sessionId` already equals the routing
-        // `sessionId` (both from the same params), so there's no routing
-        // divergence today. If the bridge ever trusts an additional
-        // `sendPrompt` field by name (e.g. a priority/temperature override),
-        // force-stamp it here like the REST surface does (`{ ...body,
-        // sessionId, prompt }`) so it can't become client-controlled.
-        params as unknown as Parameters<HttpAcpBridge['sendPrompt']>[1],
+        sanitizedParams as unknown as Parameters<
+          HttpAcpBridge['sendPrompt']
+        >[1],
         abort.signal,
-        this.sessionCtx(conn, sessionId, fromLoopback),
+        {
+          ...this.sessionCtx(conn, sessionId, fromLoopback),
+          promptId,
+          ...(clientPromptId ? { clientPromptId } : {}),
+        },
       );
       if (id !== undefined) this.replySession(conn, sessionId, id, result);
     } catch (err) {
+      if (err instanceof InvalidPromptQueueMetadataError) {
+        if (id !== undefined) {
+          this.replySession(
+            conn,
+            sessionId,
+            id,
+            undefined,
+            error(id, RPC.INVALID_PARAMS, err.message),
+          );
+        }
+        return;
+      }
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        if (id !== undefined) {
+          this.replySession(conn, sessionId, id, {
+            stopReason: 'cancelled',
+          });
+        }
+        return;
+      }
       const { code, message, data } = toRpcError(err);
       if (id !== undefined) {
         this.replySession(
@@ -5249,7 +5345,7 @@ export class AcpDispatcher {
         );
       }
     } finally {
-      if (binding.promptAbort === abort) binding.promptAbort = undefined;
+      binding.promptRequests.delete(promptId);
     }
   }
 

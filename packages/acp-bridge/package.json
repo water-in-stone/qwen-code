@@ -59,6 +59,10 @@
       "types": "./dist/daemonEventTypes.d.ts",
       "import": "./dist/daemonEventTypes.js"
     },
+    "./promptQueueProtocol": {
+      "types": "./dist/promptQueueProtocol.d.ts",
+      "import": "./dist/promptQueueProtocol.js"
+    },
     "./bridgeOptions": {
       "types": "./dist/bridgeOptions.d.ts",
       "import": "./dist/bridgeOptions.js"

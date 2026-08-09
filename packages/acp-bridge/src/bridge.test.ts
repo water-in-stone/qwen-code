@@ -13720,7 +13720,7 @@ describe('createAcpSessionBridge', () => {
       await vi.waitFor(() => expect(releaseFirst).toBeDefined());
       releaseFirst!();
       await active;
-      await expect(queued).rejects.toBeDefined();
+      await expect(queued).resolves.toEqual({ stopReason: 'cancelled' });
       await expect(
         bridge.sendPrompt(session.sessionId, {
           sessionId: session.sessionId,
@@ -14759,7 +14759,7 @@ describe('createAcpSessionBridge', () => {
 
       resolveSecond();
       await second;
-      await expect(third).rejects.toBeDefined();
+      await expect(third).resolves.toEqual({ stopReason: 'cancelled' });
       await bridge.shutdown();
     });
 
@@ -14872,7 +14872,7 @@ describe('createAcpSessionBridge', () => {
 
       resolveFirst!();
       await p1;
-      await expect(p2).rejects.toBeDefined();
+      await expect(p2).resolves.toEqual({ stopReason: 'cancelled' });
       expect(handle.agent.cancelCalls).toHaveLength(0);
       await vi.waitFor(() => {
         const removed = events.find(
@@ -14941,7 +14941,7 @@ describe('createAcpSessionBridge', () => {
 
       resolveFirst!();
       await p1;
-      await expect(p2).rejects.toBeDefined();
+      await expect(p2).resolves.toEqual({ stopReason: 'cancelled' });
       await p3;
 
       const startedTexts = events
@@ -15184,8 +15184,7 @@ describe('createAcpSessionBridge', () => {
 
       releaseFirst!();
       await expect(p1).resolves.toEqual({ stopReason: 'end_turn' });
-      // Caller-facing rejection semantics are unchanged.
-      await expect(p2).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(p2).resolves.toEqual({ stopReason: 'cancelled' });
       // B's FIFO node reached the head and threw AbortError — the latch
       // must have swallowed the would-be second terminal.
       await new Promise((r) => setTimeout(r, 20));
@@ -15195,7 +15194,11 @@ describe('createAcpSessionBridge', () => {
       await bridge.shutdown();
     });
 
-    it('publishes a deadline turn_error, unlocks the FIFO, and clears active state when the agent wedges (DAEMON-003)', async () => {
+    it('publishes a deadline turn_error but keeps the FIFO fenced until the child settles (DAEMON-003)', async () => {
+      let releaseWedged!: () => void;
+      const wedgedGate = new Promise<void>((resolve) => {
+        releaseWedged = resolve;
+      });
       let markFollowupStarted!: () => void;
       const followupStarted = new Promise<void>((resolve) => {
         markFollowupStarted = resolve;
@@ -15208,7 +15211,8 @@ describe('createAcpSessionBridge', () => {
         promptImpl: async (request) => {
           const text = (request.prompt[0] as { text?: string }).text;
           if (text === 'wedge') {
-            return new Promise<PromptResponse>(() => {});
+            await wedgedGate;
+            return { stopReason: 'cancelled' };
           }
           markFollowupStarted();
           await followupGate;
@@ -15249,7 +15253,7 @@ describe('createAcpSessionBridge', () => {
       await vi.waitFor(() => {
         expect(handle.agent.cancelCalls.length).toBeGreaterThan(0);
       });
-      // FIFO released: a follow-up prompt dispatches and completes.
+      // The caller is terminal, but the executor still owns the FIFO.
       const followup = bridge.sendPrompt(
         session.sessionId,
         {
@@ -15259,6 +15263,13 @@ describe('createAcpSessionBridge', () => {
         undefined,
         { promptId: 'prompt-after' },
       );
+      let followupDidStart = false;
+      void followupStarted.then(() => {
+        followupDidStart = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      expect(followupDidStart).toBe(false);
+      releaseWedged();
       await followupStarted;
       await expect(
         handle.agentConnection.extMethod(
@@ -15781,7 +15792,7 @@ describe('createAcpSessionBridge', () => {
       );
       await bridge.cancelSession(session.sessionId);
 
-      await expect(prompt).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' });
       expect(handle.agent.promptCalls).toHaveLength(0);
       expect(handle.agent.cancelCalls).toHaveLength(0);
       await vi.waitFor(() => {
@@ -15948,7 +15959,7 @@ describe('createAcpSessionBridge', () => {
 
       await expect(cancel).rejects.toBeInstanceOf(BridgeChannelClosedError);
       await expect(first).rejects.toBeInstanceOf(BridgeChannelClosedError);
-      await expect(second).rejects.toBeDefined();
+      await expect(second).resolves.toEqual({ stopReason: 'cancelled' });
       expect(handle.agent.promptCalls).toHaveLength(1);
       await bridge.shutdown();
     });
@@ -16016,7 +16027,7 @@ describe('createAcpSessionBridge', () => {
           { promptId },
         );
         await bridge.cancelSession(session.sessionId);
-        await expect(prompt).rejects.toMatchObject({ name: 'AbortError' });
+        await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' });
       }
 
       await vi.waitFor(() => {
@@ -26681,15 +26692,10 @@ describe('activePromptCount and lastActivityAt', () => {
 
     expect(handle.agent.promptCalls).toHaveLength(1);
     expect(resultA.ok).toBe(false);
-    expect(resultB.ok).toBe(false);
-    if (resultB.ok) {
-      throw new Error('queued prompt unexpectedly resolved');
-    }
-    // The crash-time terminal flush aborts residual FIFO nodes so they
-    // skip at the pre-dispatch check — the caller sees an AbortError
-    // (before DAEMON-005 the node reached `assertLivePromptEntry` after
-    // teardown and rejected with SessionNotFoundError instead).
-    expect((resultB.error as Error).name).toBe('AbortError');
+    expect(resultB.ok).toBe(true);
+    // The crash-time terminal flush retires residual FIFO nodes before
+    // dispatch. Their caller-facing prompt requests settle as cancelled while
+    // the running child still reports the channel failure.
 
     await vi.waitFor(() => {
       expect(bridge.activePromptCount).toBe(0);

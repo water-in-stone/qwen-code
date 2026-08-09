@@ -200,6 +200,32 @@ class FakeBridge {
     name?: string;
     clientId?: string;
   }> = [];
+  pendingPrompts: Array<{
+    promptId: string;
+    text: string;
+    queuedAt: number;
+    state: 'queued' | 'running';
+    clientPromptId?: string;
+  }> = [];
+  lastPromptRequest: unknown;
+  lastPromptContext: unknown;
+
+  getDaemonStatusSnapshot() {
+    return { limits: { maxPendingPromptsPerSession: 5 } };
+  }
+
+  getPendingPrompts() {
+    return this.pendingPrompts;
+  }
+
+  removePendingPrompt(_sessionId: string, promptId: string) {
+    const index = this.pendingPrompts.findIndex(
+      (pending) => pending.promptId === promptId,
+    );
+    if (index === -1) return { removed: false };
+    this.pendingPrompts.splice(index, 1);
+    return { removed: true };
+  }
 
   closedSessions: string[] = [];
 
@@ -309,7 +335,14 @@ class FakeBridge {
     return q.iterable;
   }
 
-  sendPrompt(sessionId: string, _req: unknown, signal?: AbortSignal) {
+  sendPrompt(
+    sessionId: string,
+    req: unknown,
+    signal?: AbortSignal,
+    context?: unknown,
+  ) {
+    this.lastPromptRequest = req;
+    this.lastPromptContext = context;
     const q = this.queues.get(sessionId);
     if (this.promptBehavior && q) {
       return Promise.resolve(this.promptBehavior(sessionId, q, signal));
@@ -1217,6 +1250,32 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
     expect(result.agentCapabilities._meta.qwen.methods).not.toContain(
       '_qwen/session/shell',
     );
+  });
+
+  it('initialize advertises the versioned next-turn prompt queue capability', async () => {
+    const { body } = await initializeRaw();
+    const result = body['result'] as {
+      agentCapabilities: {
+        _meta: {
+          qwen: {
+            methods: string[];
+            promptQueue: Record<string, unknown>;
+          };
+        };
+      };
+    };
+    expect(result.agentCapabilities._meta.qwen.methods).toEqual(
+      expect.arrayContaining([
+        '_qwen/session/prompt_queue/list',
+        '_qwen/session/prompt_queue/remove',
+      ]),
+    );
+    expect(result.agentCapabilities._meta.qwen.promptQueue).toMatchObject({
+      version: 1,
+      delivery: 'next_turn',
+      maxPendingPromptsPerSession: 5,
+      sessionCancelScope: 'running_only',
+    });
   });
 
   it('initialize advertises image capability at _meta.imageCapability', async () => {
@@ -4881,15 +4940,17 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
     expect(votes).toContainEqual({ outcome: { outcome: 'cancelled' } });
   });
 
-  it('a second concurrent prompt aborts the first', async () => {
+  it('a second concurrent prompt does not abort the first request controller', async () => {
     let firstSignal: AbortSignal | undefined;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
     bridge.promptBehavior = async (_s, _q, signal) => {
       if (!firstSignal) {
         firstSignal = signal;
-        await new Promise<void>((r) =>
-          signal?.addEventListener('abort', () => r(), { once: true }),
-        );
-        return { stopReason: 'cancelled' };
+        await firstGate;
+        return { stopReason: 'end_turn' };
       }
       return { stopReason: 'end_turn' };
     };
@@ -4911,8 +4972,100 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
       method: 'session/prompt',
       params: { sessionId: 'sess-1', prompt: [{ type: 'text', text: 'b' }] },
     });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(firstSignal?.aborted).toBe(false);
+    releaseFirst();
     await drain;
-    expect(firstSignal?.aborted).toBe(true);
+  });
+
+  it('strips queue control metadata and forwards trusted correlation separately', async () => {
+    const connId = await initialize();
+    await newSession(connId);
+    const sessStream = await openStream(connId, 'sess-1');
+    const framesPromise = takeFrames(sessStream, 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    await post(connId, {
+      jsonrpc: '2.0',
+      id: 62,
+      method: 'session/prompt',
+      params: {
+        sessionId: 'sess-1',
+        prompt: [{ type: 'text', text: 'correlated' }],
+        _meta: {
+          other: true,
+          qwen: {
+            keep: true,
+            promptQueue: { clientPromptId: 'client-correlation-1' },
+          },
+        },
+      },
+    });
+    await framesPromise;
+
+    expect(bridge.lastPromptRequest).toEqual({
+      sessionId: 'sess-1',
+      prompt: [{ type: 'text', text: 'correlated' }],
+      _meta: { other: true, qwen: { keep: true } },
+    });
+    expect(bridge.lastPromptContext).toMatchObject({
+      clientPromptId: 'client-correlation-1',
+      promptId: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+      ),
+    });
+  });
+
+  it('lists and removes only a queued prompt through the ACP extension', async () => {
+    bridge.pendingPrompts = [
+      {
+        promptId: '550e8400-e29b-41d4-a716-446655440000',
+        text: 'running',
+        queuedAt: 1,
+        state: 'running',
+      },
+      {
+        promptId: '550e8400-e29b-41d4-a716-446655440001',
+        clientPromptId: 'client-queued',
+        text: 'queued',
+        queuedAt: 2,
+        state: 'queued',
+      },
+    ];
+    const connId = await initialize();
+    await newSession(connId);
+    const stream = await openStream(connId);
+    const framesPromise = takeFrames(stream, 3);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await post(connId, {
+      jsonrpc: '2.0',
+      id: 70,
+      method: '_qwen/session/prompt_queue/list',
+      params: { sessionId: 'sess-1' },
+    });
+    await post(connId, {
+      jsonrpc: '2.0',
+      id: 71,
+      method: '_qwen/session/prompt_queue/remove',
+      params: {
+        sessionId: 'sess-1',
+        promptId: '550e8400-e29b-41d4-a716-446655440001',
+      },
+    });
+    const frames = (await framesPromise) as Array<{
+      id?: number;
+      result?: Record<string, unknown>;
+    }>;
+    expect(frames.find((frame) => frame.id === 70)?.result).toMatchObject({
+      version: 1,
+      pendingPrompts: [
+        { state: 'running' },
+        { state: 'queued', clientPromptId: 'client-queued' },
+      ],
+    });
+    expect(frames.find((frame) => frame.id === 71)?.result).toEqual({
+      removed: true,
+    });
   });
 
   it('subscribeEvents throwing closes the session stream promptly (no zombie)', async () => {
@@ -5354,6 +5507,7 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
       sessionId: 'sess-1',
       limit: 5,
       pendingCount: 5,
+      retryable: true,
     });
   });
 
@@ -5450,7 +5604,7 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
     await new Promise<void>((r) => srv.close(() => r()));
   });
 
-  it('session/cancel aborts the in-flight prompt and calls the bridge', async () => {
+  it('session/cancel delegates running-only cancellation without aborting connection controllers', async () => {
     let promptSignal: AbortSignal | undefined;
     bridge.promptBehavior = async (_s, _q, signal) => {
       promptSignal = signal;
@@ -5475,7 +5629,7 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
       params: { sessionId: 'sess-1' },
     });
     await new Promise((r) => setTimeout(r, 40));
-    expect(promptSignal?.aborted).toBe(true);
+    expect(promptSignal?.aborted).toBe(false);
     expect(bridge.cancelled).toContain('sess-1');
     await sess.body?.cancel();
   });
