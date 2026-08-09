@@ -88,6 +88,7 @@ import {
   InvalidSessionScopeError,
   SessionLimitExceededError,
   PromptQueueFullError,
+  DuplicatePromptCorrelationError,
   WorkspaceMismatchError,
   InvalidClientIdError,
   SessionShellClientRequiredError,
@@ -158,6 +159,7 @@ import {
   buildPendingPromptStartedData,
   DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION,
   isValidPromptQueueClientId,
+  isValidPromptQueuePromptId,
   parseAndStripPromptQueueMetadata,
 } from './promptQueueProtocol.js';
 import type {
@@ -1992,6 +1994,7 @@ function extractPromptText(
 
 const DEFAULT_INIT_TIMEOUT_MS = 10_000;
 const PERSIST_TIMEOUT_MS = 5_000;
+const PROMPT_CANCEL_FORWARD_TIMEOUT_MS = 5_000;
 // Bounded retries for the sub-session `parentSessionId` transcript write on the
 // spawn critical path — a transport/timeout hiccup gets a couple more tries
 // before the child is reported as live-only (`parentSessionPersisted:false`).
@@ -3030,29 +3033,68 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     if (pending.cancelForwardInitial) {
       return pending.cancelForwardInitial;
     }
+    let resolveDrain!: () => void;
+    let rejectDrain!: (reason: unknown) => void;
+    let drainSettled = false;
+    const drain = new Promise<void>((resolve, reject) => {
+      resolveDrain = resolve;
+      rejectDrain = reject;
+    });
+    const settleDrain = (error?: unknown) => {
+      if (drainSettled) return;
+      drainSettled = true;
+      if (error === undefined) resolveDrain();
+      else rejectDrain(error);
+    };
+    pending.cancelForwardDrain = drain;
+    void drain.catch(() => {});
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const forwardTimeout = new Promise<{ kind: 'timeout' }>((resolve) => {
+      timeoutHandle = setTimeout(
+        () => resolve({ kind: 'timeout' }),
+        PROMPT_CANCEL_FORWARD_TIMEOUT_MS,
+      );
+      timeoutHandle.unref();
+    });
+    const deadline = pending.cancelForwardDeadline?.then(() => ({
+      kind: 'deadline' as const,
+    }));
+    const reportForwardTimeout = () => {
+      writeStderrLine(
+        `qwen serve: prompt cancel acknowledgement timed out for ` +
+          `session ${entry.sessionId}, prompt ${pending.promptId}`,
+      );
+    };
     const initial = (async () => {
       try {
         const extension = entry.connection
-          .extMethod(PROMPT_CANCEL_METHOD, notification)
+          .extMethod(PROMPT_CANCEL_METHOD, {
+            ...notification,
+            promptId: pending.promptId,
+          })
           .then((result) => ({ kind: 'result' as const, result }));
         const outcome = await Promise.race([
           extension,
           getTransportClosedReject(entry),
-          ...(pending.cancelForwardDeadline
-            ? [
-                pending.cancelForwardDeadline.then(() => ({
-                  kind: 'deadline' as const,
-                })),
-              ]
-            : []),
+          forwardTimeout,
+          ...(deadline ? [deadline] : []),
         ]);
-        if (outcome.kind === 'deadline') return;
+        if (outcome.kind === 'deadline') {
+          settleDrain();
+          return;
+        }
+        if (outcome.kind === 'timeout') {
+          reportForwardTimeout();
+          settleDrain();
+          return;
+        }
         const { result } = outcome;
         if (typeof result['cancelled'] !== 'boolean') {
           throw new Error(
             `${PROMPT_CANCEL_METHOD} returned an invalid acknowledgement`,
           );
         }
+        settleDrain();
       } catch (error) {
         if (
           (typeof error === 'object' &&
@@ -3061,16 +3103,27 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             error.code === -32601) ||
           isNotCurrentlyGeneratingCancelError(error)
         ) {
-          await Promise.race([
+          const fallback = Promise.race([
             entry.connection.cancel(notification),
             getTransportClosedReject(entry),
-            ...(pending.cancelForwardDeadline
-              ? [pending.cancelForwardDeadline]
-              : []),
           ]);
+          const fallbackFence = fallback.then(
+            () => settleDrain(),
+            (fallbackError) => settleDrain(fallbackError),
+          );
+          void fallbackFence.catch(() => {});
+          const fallbackOutcome = await Promise.race([
+            fallback.then(() => ({ kind: 'result' as const })),
+            forwardTimeout,
+            ...(deadline ? [deadline] : []),
+          ]);
+          if (fallbackOutcome.kind === 'timeout') reportForwardTimeout();
           return;
         }
+        settleDrain(error);
         throw error;
+      } finally {
+        clearTimeout(timeoutHandle);
       }
     })().catch((error) => {
       if (pending.cancelForwardInitial === initial) {
@@ -3079,13 +3132,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       throw error;
     });
     pending.cancelForwardInitial = initial;
-    // The same-revision extension resolves only after cancellation is handled
-    // (or the target prompt has already settled). ACP-compatible custom agents
-    // that do not implement it receive one standard session/cancel notification.
-    // The FIFO tail awaits this promise so no extension request remains in flight
-    // when prompt ownership advances, except when the prompt deadline invokes the
-    // documented DAEMON-003 overlap policy.
-    pending.cancelForwardDrain = initial;
+    // A prompt-correlated extension may safely time out: a late acknowledgement
+    // still names the old prompt. The standard ACP fallback is session-scoped,
+    // so its write remains the FIFO fence even after the caller-facing timeout;
+    // otherwise a late cancel could hit the successor turn.
     void initial.catch(() => {});
     return initial;
   };
@@ -7115,7 +7165,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       let total = 0;
       for (const entry of byId.values()) {
         for (const pending of entry.pendingPromptList) {
-          if (pending.state === 'queued') total += 1;
+          if (pending.state === 'queued' && !pending.queueRetired) total += 1;
         }
       }
       return total;
@@ -7606,12 +7656,17 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       if (sanitizedMeta) sanitizedRequest._meta = sanitizedMeta;
       else delete sanitizedRequest._meta;
       const promptId = context?.promptId ?? randomUUID();
+      if (!isValidPromptQueuePromptId(promptId)) {
+        throw new TypeError(
+          'Bridge promptId must be a non-empty string of at most 128 characters without control characters.',
+        );
+      }
       if (
         entry.admittedPromptIds.has(promptId) ||
         (clientPromptId !== undefined &&
           entry.admittedClientPromptIds.has(clientPromptId))
       ) {
-        throw new TypeError('Duplicate admitted prompt correlation id.');
+        throw new DuplicatePromptCorrelationError();
       }
       if (
         !isPromotedMidTurn &&
@@ -7647,15 +7702,15 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       });
       const isQueued = entry.pendingPromptCount > 1;
       const pendingAbort = new AbortController();
+      let detachCallerAbort = () => {};
       if (signal) {
         if (signal.aborted) {
           pendingAbort.abort(signal.reason);
         } else {
-          signal.addEventListener(
-            'abort',
-            () => pendingAbort.abort(signal.reason),
-            { once: true },
-          );
+          const onCallerAbort = () => pendingAbort.abort(signal.reason);
+          signal.addEventListener('abort', onCallerAbort, { once: true });
+          detachCallerAbort = () =>
+            signal.removeEventListener('abort', onCallerAbort);
         }
       }
       const channelDisplayText = getChannelPromptDisplayText(
@@ -7695,6 +7750,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       };
       entry.pendingPromptList.push(pendingEntry);
       let deadlineTimer: NodeJS.Timeout | undefined;
+      const clearDeadlineTimer = () => {
+        if (deadlineTimer === undefined) return;
+        clearTimeout(deadlineTimer);
+        deadlineTimer = undefined;
+      };
       const settleCaller = (
         outcome:
           | { kind: 'resolve'; response: PromptResponse }
@@ -7702,10 +7762,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       ) => {
         if (pendingEntry.callerSettled) return;
         pendingEntry.callerSettled = true;
-        if (deadlineTimer !== undefined) {
-          clearTimeout(deadlineTimer);
-          deadlineTimer = undefined;
-        }
+        detachCallerAbort();
+        detachCallerAbort = () => {};
+        if (!pendingEntry.cancelForwardDrain) clearDeadlineTimer();
         if (outcome.kind === 'resolve') {
           pendingEntry.resolveCaller?.(outcome.response);
         } else {
@@ -7713,8 +7772,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         }
       };
       const publishQueueCompleted = (state: 'completed' | 'removed') => {
-        if (!pendingEntry.wasQueued || pendingEntry.queueRetired) return;
+        if (pendingEntry.queueRetired) return;
         pendingEntry.queueRetired = state;
+        pendingEntry.text = undefined;
+        if (!pendingEntry.wasQueued) return;
         entry.events.publish({
           type: 'pending_prompt_completed',
           promptId: pendingEntry.promptId,
@@ -7811,7 +7872,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
           releaseCancelForward = resolve;
         });
         const onDeadline = () => {
-          if (pendingEntry.callerSettled) return;
+          if (pendingEntry.callerSettled) {
+            releaseCancelForward();
+            return;
+          }
           const deadlineErr = new PromptDeadlineExceededError(deadlineMs);
           writeStderrLine(
             `sendPrompt: prompt ${promptId} exceeded ${deadlineMs}ms deadline ` +
@@ -8223,6 +8287,8 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         } catch {
           // The initiating mutation already reports or logs forwarding
           // failures. The queue only needs to fence any in-flight write.
+        } finally {
+          clearDeadlineTimer();
         }
       };
       entry.promptQueue = executorResult.then(
@@ -8305,7 +8371,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         context?.clientId,
       );
       const runningPrompt = entry.pendingPromptList.find(
-        (pending) => pending.state === 'running' && !pending.terminalPublished,
+        (pending) => pending.state === 'running',
       );
       // Broadcast `prompt_cancelled` so other SSE-subscribed clients see
       // the cancel as a first-class event rather than inferring it from

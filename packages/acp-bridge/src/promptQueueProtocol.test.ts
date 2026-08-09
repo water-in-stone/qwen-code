@@ -14,6 +14,7 @@ import {
   buildPendingPromptAddedData,
   buildPendingPromptCompletedData,
   buildPromptQueueFullErrorData,
+  isValidPromptQueuePromptId,
   isValidPromptQueueServerId,
   parseAndStripPromptQueueMetadata,
 } from './promptQueueProtocol.js';
@@ -119,5 +120,14 @@ describe('prompt queue protocol', () => {
     expect(
       isValidPromptQueueServerId('550e8400-e29b-11d4-a716-446655440000'),
     ).toBe(false);
+  });
+
+  it('accepts bounded opaque prompt correlation ids', () => {
+    expect(isValidPromptQueuePromptId('prompt-1')).toBe(true);
+    expect(isValidPromptQueuePromptId('用户 prompt 1')).toBe(true);
+    expect(isValidPromptQueuePromptId('   ')).toBe(false);
+    expect(isValidPromptQueuePromptId('prompt\n2')).toBe(false);
+    expect(isValidPromptQueuePromptId('prompt\u00852')).toBe(false);
+    expect(isValidPromptQueuePromptId('x'.repeat(129))).toBe(false);
   });
 });

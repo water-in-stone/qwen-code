@@ -259,6 +259,13 @@ export class PromptQueueFullError extends Error {
   }
 }
 
+export class DuplicatePromptCorrelationError extends TypeError {
+  constructor() {
+    super('Duplicate admitted prompt correlation id.');
+    this.name = 'DuplicatePromptCorrelationError';
+  }
+}
+
 /**
  * Rejected by `sendPrompt` when an accepted prompt exceeds its wallclock
  * deadline (`BridgeClientRequestContext.deadlineMs`). The bridge publishes a

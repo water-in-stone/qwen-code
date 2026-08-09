@@ -29,6 +29,7 @@ export const PROMPT_QUEUE_METHODS = [
 export const PROMPT_QUEUE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 export const PROMPT_QUEUE_SERVER_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const PROMPT_QUEUE_PROMPT_ID_MAX_LENGTH = 128;
 
 export type PromptQueueEventKind =
   | typeof PENDING_PROMPT_ADDED_EVENT
@@ -93,6 +94,18 @@ export function isValidPromptQueueClientId(value: unknown): value is string {
 export function isValidPromptQueueServerId(value: unknown): value is string {
   return (
     typeof value === 'string' && PROMPT_QUEUE_SERVER_ID_PATTERN.test(value)
+  );
+}
+
+export function isValidPromptQueuePromptId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length <= PROMPT_QUEUE_PROMPT_ID_MAX_LENGTH &&
+    value.trim().length > 0 &&
+    ![...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x1f || (code >= 0x7f && code <= 0x9f);
+    })
   );
 }
 

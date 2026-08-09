@@ -371,10 +371,7 @@ describe('ConnectionRegistry.getSnapshot', () => {
         new AbortController(),
       );
       const promptAbort = new AbortController();
-      binding.promptRequests.set('prompt-1', {
-        controller: promptAbort,
-        requestId: 1,
-      });
+      binding.promptRequests.set('prompt-1', promptAbort);
 
       // Transport-level close → detach with grace (NOT teardown).
       conn.detachSessionStream('sess-1', stream, 10_000);
@@ -412,10 +409,7 @@ describe('ConnectionRegistry.getSnapshot', () => {
         new AbortController(),
       );
       const promptAbort = new AbortController();
-      binding.promptRequests.set('prompt-1', {
-        controller: promptAbort,
-        requestId: 1,
-      });
+      binding.promptRequests.set('prompt-1', promptAbort);
 
       conn.detachSessionStream('sess-1', s1, 10_000);
       // Reconnect within grace.

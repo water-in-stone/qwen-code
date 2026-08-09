@@ -26,6 +26,7 @@ import {
 } from '@qwen-code/acp-bridge/sessionArtifacts';
 import {
   CancelSentinelCollisionError,
+  DuplicatePromptCorrelationError,
   InvalidClientIdError,
   InvalidPermissionOptionError,
   PermissionForbiddenError,
@@ -5508,6 +5509,34 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
       limit: 5,
       pendingCount: 5,
       retryable: true,
+    });
+  });
+
+  it('session/prompt maps duplicate correlation ids to INVALID_PARAMS', async () => {
+    bridge.promptBehavior = () => {
+      throw new DuplicatePromptCorrelationError();
+    };
+    const connId = await initialize();
+    await newSession(connId);
+    const sessStream = await openStream(connId, 'sess-1');
+    const got = takeFrames(sessStream, 1);
+    await new Promise((r) => setTimeout(r, 50));
+    await post(connId, {
+      jsonrpc: '2.0',
+      id: 47,
+      method: 'session/prompt',
+      params: {
+        sessionId: 'sess-1',
+        prompt: [{ type: 'text', text: 'duplicate' }],
+      },
+    });
+
+    const [frame] = (await got) as Array<{
+      error: { code: number; message: string };
+    }>;
+    expect(frame.error).toEqual({
+      code: -32602,
+      message: 'Duplicate admitted prompt correlation id.',
     });
   });
 

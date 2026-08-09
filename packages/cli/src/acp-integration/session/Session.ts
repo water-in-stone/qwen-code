@@ -872,6 +872,11 @@ function recordDaemonInvalidToolParams(
 // means the client silently drops unknown methods; without a deadline the
 // await would wedge the prompt turn forever.
 const MID_TURN_QUEUE_DRAIN_TIMEOUT_MS = 2_000;
+// Keep one recovery slot beside a timed-out boundary inspection. The ACP SDK
+// cannot cancel an extMethod request, so retries must be globally bounded per
+// Session while still allowing a later probe (including a new prompt owner) to
+// recover from one lost response.
+const MAX_REMOTE_TURN_BOUNDARY_INSPECTIONS = 2;
 // Secondary deadline for recovering a drain whose response arrives AFTER the
 // 2s race timeout: within this window the late answer is re-injected on the next
 // batch; beyond it (e.g. degraded transport) it is dropped rather than pushed
@@ -1556,6 +1561,11 @@ export class Session implements SessionContext {
   private automaticBoundaryWatchdog: NodeJS.Timeout | undefined;
   private automaticBoundaryWatchdogOwner: string | undefined;
   private automaticBoundaryWatchdogAttempt = 0;
+  private readonly remoteTurnBoundaryInspections = new Set<{
+    ownerPromptId: string;
+    result: Promise<TurnBoundaryInspection>;
+    timedOut: boolean;
+  }>();
   /**
    * Per-turn AbortController for the fire-and-forget follow-up suggestion
    * generation. Aborted on the top of the next `prompt()` and on
@@ -2457,14 +2467,50 @@ export class Session implements SessionContext {
   async #inspectRemoteTurnBoundary(
     ownerPromptId: string,
   ): Promise<TurnBoundaryInspection> {
+    const inspections = this.remoteTurnBoundaryInspections;
+    const client = this.client;
+    const sessionId = this.sessionId;
+    let inspection = [...inspections].find(
+      (candidate) =>
+        candidate.ownerPromptId === ownerPromptId && !candidate.timedOut,
+    );
+    if (
+      !inspection &&
+      inspections.size >= MAX_REMOTE_TURN_BOUNDARY_INSPECTIONS
+    ) {
+      return 'unavailable';
+    }
+    if (!inspection) {
+      const nextInspection = {
+        ownerPromptId,
+        timedOut: false,
+        result: Promise.resolve()
+          .then(() =>
+            client.extMethod(MID_TURN_QUEUE_DRAIN_METHOD, {
+              sessionId,
+              promptId: ownerPromptId,
+              inspectQueuedPromptOnly: true,
+            }),
+          )
+          .then((response) =>
+            isRecord(response) && response['hasQueuedPrompt'] === false
+              ? ('clear' as const)
+              : isRecord(response) && response['hasQueuedPrompt'] === true
+                ? ('queued' as const)
+                : ('unavailable' as const),
+          )
+          .catch(() => 'unavailable' as const)
+          .finally(() => {
+            inspections.delete(nextInspection);
+          }),
+      };
+      inspection = nextInspection;
+      inspections.add(inspection);
+    }
     let timeoutHandle: NodeJS.Timeout | undefined;
     try {
       const response = await Promise.race([
-        this.client.extMethod(MID_TURN_QUEUE_DRAIN_METHOD, {
-          sessionId: this.sessionId,
-          promptId: ownerPromptId,
-          inspectQueuedPromptOnly: true,
-        }),
+        inspection.result,
         new Promise<never>((_, reject) => {
           timeoutHandle = setTimeout(
             () => reject(new MidTurnDrainTimeoutError()),
@@ -2472,12 +2518,11 @@ export class Session implements SessionContext {
           );
         }),
       ]);
-      return isRecord(response) && response['hasQueuedPrompt'] === false
-        ? 'clear'
-        : isRecord(response) && response['hasQueuedPrompt'] === true
-          ? 'queued'
-          : 'unavailable';
-    } catch {
+      return response;
+    } catch (error) {
+      if (error instanceof MidTurnDrainTimeoutError) {
+        inspection.timedOut = true;
+      }
       return 'unavailable';
     } finally {
       clearTimeout(timeoutHandle);
@@ -3205,6 +3250,19 @@ export class Session implements SessionContext {
     return this.historyMutationOwner !== undefined;
   }
 
+  isClosing(): boolean {
+    return this.closing;
+  }
+
+  hasConditionalCloseBlocker(): boolean {
+    return (
+      this.deferredAutomaticBoundary !== undefined ||
+      this.#hasActiveTurn() ||
+      this.cronQueue.length > 0 ||
+      this.notificationQueue.length > 0
+    );
+  }
+
   beginHistoryMutation(): () => void {
     if (this.closing) {
       throw RequestError.invalidParams(undefined, 'Session is closing');
@@ -3318,6 +3376,7 @@ export class Session implements SessionContext {
     this.closing = true;
     this.deferredAutomaticBoundary = undefined;
     this.automaticBoundaryReleasedBeforeRecord.clear();
+    this.remoteTurnBoundaryInspections.clear();
     this.#clearAutomaticBoundaryWatchdog();
     this.pendingPrompt?.abort(SESSION_DISPOSE_ABORT_REASON);
     this.pendingPrompt = null;

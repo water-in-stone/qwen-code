@@ -66,13 +66,14 @@ import type { BridgeEvent } from '@qwen-code/acp-bridge/eventBus';
 import {
   addPromptQueueCapabilityToMeta,
   InvalidPromptQueueMetadataError,
-  isValidPromptQueueServerId,
+  isValidPromptQueuePromptId,
   parseAndStripPromptQueueMetadata,
   PROMPT_QUEUE_LIST_METHOD,
   PROMPT_QUEUE_PROTOCOL_VERSION,
   PROMPT_QUEUE_REMOVE_METHOD,
 } from '@qwen-code/acp-bridge/promptQueueProtocol';
 import {
+  DuplicatePromptCorrelationError,
   SessionNotFoundError,
   SessionShellClientRequiredError,
   SessionShellDisabledError,
@@ -671,6 +672,9 @@ export function toRpcError(err: unknown): {
   const writerError = sessionWriterRpcError(err);
   if (writerError) return writerError;
   if (err instanceof AcpParamError || err instanceof InvalidCursorError) {
+    return { code: RPC.INVALID_PARAMS, message: err.message };
+  }
+  if (err instanceof DuplicatePromptCorrelationError) {
     return { code: RPC.INVALID_PARAMS, message: err.message };
   }
   if (err instanceof SessionOrganizationError) {
@@ -2709,13 +2713,13 @@ export class AcpDispatcher {
           const sessionId = String(params['sessionId'] ?? '');
           await this.withMutableOwned(conn, sessionId, id, async () => {
             const promptId = params['promptId'];
-            if (!isValidPromptQueueServerId(promptId)) {
+            if (!isValidPromptQueuePromptId(promptId)) {
               if (id !== undefined) {
                 conn.sendConn(
                   error(
                     id,
                     RPC.INVALID_PARAMS,
-                    '`promptId` must be a canonical UUID',
+                    '`promptId` must be a non-blank string of at most 128 characters without control characters',
                   ),
                 );
               }
@@ -5286,7 +5290,7 @@ export class AcpDispatcher {
     const binding = conn.getOrCreateSession(sessionId);
     const promptId = randomUUID();
     const abort = new AbortController();
-    binding.promptRequests.set(promptId, { controller: abort, requestId: id });
+    binding.promptRequests.set(promptId, abort);
     try {
       const rawMeta = isObject(params['_meta']) ? params['_meta'] : undefined;
       const { clientPromptId, meta } =

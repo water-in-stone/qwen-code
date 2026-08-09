@@ -27,7 +27,7 @@ interface InvocationContextV1 {
 ```
 
 - `sessionId` is the live daemon session selected by the request route.
-- `promptId` is fixed when the daemon admits the prompt, before it waits in the per-session queue. Non-blocking callers may supply the correlation id used by existing terminal-event matching; otherwise the daemon generates a UUID. In either case the value identifies the prompt the daemon actually admitted, rather than metadata copied from the prompt body.
+- `promptId` is fixed when the daemon admits the prompt, before it waits in the per-session queue. Non-blocking callers may supply a non-blank correlation id of at most 128 characters without control characters; otherwise the daemon generates a UUID. In either case the value identifies the prompt the daemon actually admitted, rather than metadata copied from the prompt body.
 - `originatorClientId`, when present, is the request header value after the daemon verifies it is registered on that session.
 - Unknown fields, unknown versions, and blank identifiers are invalid.
 

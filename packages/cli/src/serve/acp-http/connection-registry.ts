@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { writeStderrLine } from '../../utils/stdioHelpers.js';
-import { logSafe, type JsonRpcId } from './json-rpc.js';
+import { logSafe } from './json-rpc.js';
 import type { TransportStream } from './transport-stream.js';
 
 /**
@@ -102,10 +102,7 @@ export interface SessionBinding {
    */
   abort: AbortController;
   /** Prompts submitted through this ACP connection, keyed by bridge prompt id. */
-  promptRequests: Map<
-    string,
-    { controller: AbortController; requestId: JsonRpcId | undefined }
-  >;
+  promptRequests: Map<string, AbortController>;
   /**
    * Armed by `detachSessionStream` when the session stream closes at the
    * transport level (proxy idle-close, network blip) WITHOUT an explicit
@@ -799,7 +796,7 @@ export class AcpConnection {
       binding.graceTimer = undefined;
     }
     binding.abort.abort();
-    for (const { controller } of binding.promptRequests.values()) {
+    for (const controller of binding.promptRequests.values()) {
       controller.abort();
     }
     binding.promptRequests.clear();

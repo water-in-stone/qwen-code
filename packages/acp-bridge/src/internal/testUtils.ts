@@ -243,8 +243,9 @@ export class FakeAgent implements Agent {
         throw RequestError.methodNotFound(method);
       }
       const sessionId = params['sessionId'];
-      if (typeof sessionId !== 'string') {
-        throw new Error('Invalid or missing sessionId');
+      const promptId = params['promptId'];
+      if (typeof sessionId !== 'string' || typeof promptId !== 'string') {
+        throw new Error('Invalid prompt cancellation correlation');
       }
       let delayMs = 1;
       while (true) {

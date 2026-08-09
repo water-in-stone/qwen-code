@@ -680,7 +680,8 @@ export interface BridgeClientRequestContext {
    */
   fromLoopback?: boolean;
   /**
-   * Caller-generated correlation id for non-blocking prompt mode.
+   * Caller-generated, non-blank correlation id (at most 128 characters, no
+   * control characters) for non-blocking prompt mode.
    * When present, the bridge stamps turn-scoped event envelopes with this id.
    * The legacy `turn_complete.data.promptId` / `turn_error.data.promptId`
    * fields remain populated so the SDK's `prompt()` can match the terminal
@@ -840,7 +841,11 @@ export interface TodoStopGuardQueueReleasedRequest {
   promptId: string;
 }
 
-/** Parent-to-agent request that acknowledges prompt cancellation handling. */
+/**
+ * Parent-to-agent request to cancel one exact running prompt. The request
+ * carries `sessionId` and `promptId`; a stale prompt id is acknowledged as a
+ * no-op so late delivery cannot cancel a successor.
+ */
 export const PROMPT_CANCEL_METHOD = 'craft/cancelPendingPrompt';
 
 /**

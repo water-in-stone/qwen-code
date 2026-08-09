@@ -16705,7 +16705,10 @@ describe('Session', () => {
           mockSettings,
           undefined,
           undefined,
-          { hasQueuedPrompt: () => hasQueuedPrompt },
+          {
+            inspectRemoteQueue: false,
+            hasQueuedPrompt: () => hasQueuedPrompt,
+          },
         );
 
         const activating = session.prompt(
@@ -30062,6 +30065,56 @@ describe('Session', () => {
       ).toBe(true);
     });
 
+    it('blocks conditional close while released automatic work waits for history ownership', async () => {
+      session.dispose();
+      (mockSettings as unknown as { merged: Record<string, unknown> }).merged =
+        {};
+      let markMutationQueued!: () => void;
+      const mutationQueued = new Promise<void>((resolve) => {
+        markMutationQueued = resolve;
+      });
+      let releaseMutation!: () => void;
+      const mutationGate = new Promise<void>((resolve) => {
+        releaseMutation = resolve;
+      });
+      session = new Session(
+        'test-session-id',
+        mockConfig,
+        mockClient,
+        mockSettings,
+        async (operation) => {
+          markMutationQueued();
+          await mutationGate;
+          return operation();
+        },
+      );
+      mockChat.sendMessageStream = vi
+        .fn()
+        .mockResolvedValue(createEmptyStream());
+      const ownerPromptId = 'released-automatic-owner';
+      const internals = session as unknown as {
+        deferredAutomaticBoundary?: { ownerPromptId: string };
+        cronQueue: Array<{ prompt: string; source: 'cron' }>;
+      };
+      internals.deferredAutomaticBoundary = { ownerPromptId };
+      internals.cronQueue.push({
+        prompt: 'run after the queued successor disappears',
+        source: 'cron',
+      });
+
+      expect(session.releaseTodoStopGuardQueuedPromptWait(ownerPromptId)).toBe(
+        true,
+      );
+      await mutationQueued;
+      expect(session.hasConditionalCloseBlocker()).toBe(true);
+
+      releaseMutation();
+      await vi.waitFor(() =>
+        expect(session.hasConditionalCloseBlocker()).toBe(false),
+      );
+      expect(mockChat.sendMessageStream).toHaveBeenCalledOnce();
+    });
+
     it('clears an early release when no queued successor remains at the boundary', async () => {
       session.dispose();
       let hasQueuedPrompt = true;
@@ -30211,6 +30264,167 @@ describe('Session', () => {
 
         releaseSuccessor();
         await successor;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('caps unresolved remote boundary inspections at two per session', async () => {
+      vi.useFakeTimers();
+      try {
+        session.dispose();
+        let inspectionCount = 0;
+        vi.mocked(mockClient.extMethod).mockImplementation(
+          async (_method, params) => {
+            if (params['inspectQueuedPromptOnly'] !== true) return {};
+            inspectionCount += 1;
+            if (inspectionCount === 1) return { hasQueuedPrompt: true };
+            return new Promise<Record<string, unknown>>(() => {});
+          },
+        );
+        session = new Session(
+          'test-session-id',
+          mockConfig,
+          mockClient,
+          mockSettings,
+          undefined,
+          undefined,
+          { inspectRemoteQueue: true, hasQueuedPrompt: () => false },
+        );
+        mockChat.sendMessageStream = vi
+          .fn()
+          .mockResolvedValueOnce(createEmptyStream());
+
+        await session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'defer automatic work' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'prompt-with-hung-inspection',
+          },
+        );
+        expect(inspectionCount).toBe(1);
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(inspectionCount).toBe(3);
+        const internals = session as unknown as {
+          remoteTurnBoundaryInspections: Set<unknown>;
+        };
+        expect(internals.remoteTurnBoundaryInspections.size).toBe(2);
+        session.dispose();
+        expect(internals.remoteTurnBoundaryInspections.size).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('treats a synchronous remote boundary inspection failure as unavailable', async () => {
+      session.dispose();
+      let inspectionCount = 0;
+      vi.mocked(mockClient.extMethod).mockImplementation((_method, params) => {
+        if (params['inspectQueuedPromptOnly'] === true) {
+          inspectionCount += 1;
+          throw new Error('connection already closed');
+        }
+        return Promise.resolve({});
+      });
+      session = new Session(
+        'test-session-id',
+        mockConfig,
+        mockClient,
+        mockSettings,
+        undefined,
+        undefined,
+        { inspectRemoteQueue: true, hasQueuedPrompt: () => false },
+      );
+      mockChat.sendMessageStream = vi
+        .fn()
+        .mockResolvedValueOnce(createEmptyStream());
+
+      await expect(
+        session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'inspect after disconnect' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'sync-inspection-failure',
+          },
+        ),
+      ).resolves.toBeDefined();
+      expect(inspectionCount).toBe(1);
+      session.dispose();
+    });
+
+    it('uses the bounded recovery slot for a successor prompt owner', async () => {
+      vi.useFakeTimers();
+      try {
+        session.dispose();
+        let inspectionCount = 0;
+        vi.mocked(mockClient.extMethod).mockImplementation(
+          async (_method, params) => {
+            if (params['inspectQueuedPromptOnly'] !== true) return {};
+            inspectionCount += 1;
+            if (inspectionCount === 1) return { hasQueuedPrompt: true };
+            if (inspectionCount === 2) {
+              return new Promise<Record<string, unknown>>(() => {});
+            }
+            return { hasQueuedPrompt: false };
+          },
+        );
+        session = new Session(
+          'test-session-id',
+          mockConfig,
+          mockClient,
+          mockSettings,
+          undefined,
+          undefined,
+          { inspectRemoteQueue: true, hasQueuedPrompt: () => false },
+        );
+        mockChat.sendMessageStream = vi
+          .fn()
+          .mockResolvedValueOnce(createEmptyStream())
+          .mockResolvedValueOnce(createEmptyStream());
+
+        await session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'first owner' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'first-owner',
+          },
+        );
+        await vi.advanceTimersByTimeAsync(2_250);
+        expect(inspectionCount).toBe(2);
+
+        await session.prompt(
+          {
+            sessionId: 'test-session-id',
+            prompt: [{ type: 'text', text: 'successor owner' }],
+          },
+          {
+            version: 1,
+            sessionId: 'test-session-id',
+            promptId: 'successor-owner',
+          },
+        );
+        expect(inspectionCount).toBe(3);
+        const internals = session as unknown as {
+          deferredAutomaticBoundary?: unknown;
+        };
+        expect(internals.deferredAutomaticBoundary).toBeUndefined();
+
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(inspectionCount).toBe(3);
+        session.dispose();
       } finally {
         vi.useRealTimers();
       }

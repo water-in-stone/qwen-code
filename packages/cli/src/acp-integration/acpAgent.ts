@@ -190,7 +190,7 @@ import {
   buildPendingPromptCompletedData,
   buildPendingPromptStartedData,
   buildPromptQueueFullErrorData,
-  isValidPromptQueueServerId,
+  isValidPromptQueuePromptId,
   parseAndStripPromptQueueMetadata,
 } from '@qwen-code/acp-bridge/promptQueueProtocol';
 import {
@@ -620,11 +620,15 @@ async function waitForSessionDrain(
 async function beginSessionCloseAfterCurrentGate(
   session: Session,
   timeoutMs: number,
+  onAcquired?: () => void,
 ): Promise<() => void> {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     const releaseGate = session.beginCloseIfAvailable();
-    if (releaseGate) return releaseGate;
+    if (releaseGate) {
+      onAcquired?.();
+      return releaseGate;
+    }
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       throw new Error(`Session close timed out after ${timeoutMs}ms`);
@@ -3870,6 +3874,7 @@ class QwenAgent implements Agent {
   >();
   private readonly pendingConfigCleanup = new Map<string, Set<Config>>();
   private readonly initializingConfigs = new Set<Config>();
+  private readonly liveSessionRestores = new Set<Promise<void>>();
   private managedShuttingDown = false;
   private clientCapabilities: ClientCapabilities | undefined;
   /** Set once the daemon negotiates active-work reporting; one per channel. */
@@ -4072,16 +4077,6 @@ class QwenAgent implements Agent {
           );
         }
         let outcome: { response: PromptResponse } | { error: unknown };
-        const call: ActivePromptCall = {
-          controller: entry.controller,
-          settled: entry.executorSettled,
-        };
-        let calls = this.activePromptCalls.get(state.session.sessionId);
-        if (!calls) {
-          calls = new Set();
-          this.activePromptCalls.set(state.session.sessionId, calls);
-        }
-        calls.add(call);
         try {
           const params = entry.params;
           outcome = params
@@ -4096,11 +4091,6 @@ class QwenAgent implements Agent {
             : { response: { stopReason: 'cancelled' } };
         } catch (error) {
           outcome = { error };
-        } finally {
-          calls.delete(call);
-          if (calls.size === 0) {
-            this.activePromptCalls.delete(state.session.sessionId);
-          }
         }
         try {
           await this.activeWorkReporter?.flush();
@@ -4265,7 +4255,10 @@ class QwenAgent implements Agent {
     this.workspaceGenerationControllers.clear();
 
     const configs = new Set<Config>([this.config, ...this.initializingConfigs]);
+    const promptDrains: Array<Promise<void>> = [];
     for (const session of this.sessions.values()) {
+      const queue = this.promptQueues.get(session.getId());
+      if (queue?.session === session) queue.admissionClosed = true;
       try {
         session.beginCloseIfAvailable();
       } catch (error) {
@@ -4275,13 +4268,26 @@ class QwenAgent implements Agent {
           }`,
         );
       }
-      void session.cancelPendingPrompt().catch((error) => {
-        debugLogger.debug(
-          `Session ${session.getId()} cancel during managed shutdown failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
+      const cancel =
+        queue?.session === session
+          ? this.cancelAllPromptEntries(queue)
+          : session.cancelPendingPrompt();
+      promptDrains.push(
+        waitForSessionDrain(cancel, SESSION_DRAIN_TIMEOUT_MS, 'close', () => {
+          if (
+            queue?.session === session &&
+            this.promptQueues.get(session.getId()) === queue
+          ) {
+            this.invalidatePromptQueue(queue);
+          }
+        }).catch((error) => {
+          debugLogger.debug(
+            `Session ${session.getId()} cancel during managed shutdown failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }),
+      );
       configs.add(session.getConfig());
     }
     for (const pending of this.pendingConfigCleanup.values()) {
@@ -4289,27 +4295,30 @@ class QwenAgent implements Agent {
     }
 
     const configList = [...configs];
-    const writerTerminals: Array<Promise<void>> = [];
-    for (const config of configList) {
-      try {
-        writerTerminals.push(config.closeSessionWriter({ handoff: true }));
-      } catch (error) {
-        writerTerminals.push(Promise.reject(error));
-      }
-    }
-    const writerShutdown = Promise.allSettled(writerTerminals).then(
-      (results) => {
-        const failures = results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        );
-        if (failures.length > 0) {
-          throw new AggregateError(
-            failures,
-            'Managed session writer shutdown failed',
-          );
+    const admittedRestores = [...this.liveSessionRestores];
+    const writerShutdown = Promise.all([
+      ...admittedRestores,
+      ...promptDrains,
+    ]).then(async () => {
+      const writerTerminals: Array<Promise<void>> = [];
+      for (const config of configList) {
+        try {
+          writerTerminals.push(config.closeSessionWriter({ handoff: true }));
+        } catch (error) {
+          writerTerminals.push(Promise.reject(error));
         }
-      },
-    );
+      }
+      const results = await Promise.allSettled(writerTerminals);
+      const failures = results.flatMap((result) =>
+        result.status === 'rejected' ? [result.reason] : [],
+      );
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          'Managed session writer shutdown failed',
+        );
+      }
+    });
     return { configs: configList, writerShutdown };
   }
 
@@ -4765,10 +4774,38 @@ class QwenAgent implements Agent {
       projection: SessionLiveRestoreProjection | undefined,
     ) => Promise<T>,
   ): Promise<T> {
-    await session.assertCanStartTurn();
-    const config = session.getConfig();
-    const releaseGate = session.beginClose();
+    let resolveRestore!: () => void;
+    const restoreCompletion = new Promise<void>((resolve) => {
+      resolveRestore = resolve;
+    });
+    this.liveSessionRestores.add(restoreCompletion);
+    let queue: AcpPromptQueueState | undefined;
+    let releaseGate: (() => void) | undefined;
     try {
+      this.assertManagedSessionAdmission();
+      queue = this.promptQueues.get(sessionId);
+      if (
+        !queue ||
+        queue.session !== session ||
+        queue.admissionClosed ||
+        queue.invalidated
+      ) {
+        throw new RequestError(-32602, 'Session is busy processing a turn', {
+          errorKind: 'session_busy',
+        });
+      }
+      queue.admissionClosed = true;
+      await session.assertCanStartTurn();
+      await waitForSessionDrain(
+        queue.drainCompletion ?? Promise.resolve(),
+        SESSION_DRAIN_TIMEOUT_MS,
+        'restore',
+      );
+      if (!this.isCurrentPromptQueueState(queue)) {
+        throw new SessionWriterUnavailableError();
+      }
+      const config = session.getConfig();
+      releaseGate = session.beginClose();
       await waitForSessionDrain(
         session.waitForActiveTurnsToSettle(),
         SESSION_DRAIN_TIMEOUT_MS,
@@ -4787,7 +4824,44 @@ class QwenAgent implements Agent {
     } catch (error) {
       throw mapSessionRestoreRequestError(error, sessionId);
     } finally {
-      releaseGate();
+      try {
+        this.releaseSessionCloseGate(sessionId, session, queue, releaseGate);
+      } finally {
+        this.liveSessionRestores.delete(restoreCompletion);
+        resolveRestore();
+      }
+    }
+  }
+
+  private releaseSessionCloseGate(
+    sessionId: string,
+    session: Session,
+    queue: AcpPromptQueueState | undefined,
+    releaseGate: (() => void) | undefined,
+  ): void {
+    releaseGate?.();
+    if (this.managedShuttingDown && this.sessions.get(sessionId) === session) {
+      if (
+        queue &&
+        this.promptQueues.get(sessionId) === queue &&
+        !queue.invalidated
+      ) {
+        queue.admissionClosed = true;
+      }
+      try {
+        // Managed shutdown owns this replacement gate until disposal.
+        session.beginCloseIfAvailable();
+      } catch (error) {
+        debugLogger.debug(
+          `Session ${sessionId} close reacquire after managed shutdown race failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      return;
+    }
+    if (queue && this.isCurrentPromptQueueState(queue)) {
+      if (!session.isClosing()) queue.admissionClosed = false;
     }
   }
 
@@ -4898,7 +4972,13 @@ class QwenAgent implements Agent {
     try {
       if (requireFlush) await recorder?.flush();
       cancelClose = opts?.waitForCloseGate
-        ? await beginSessionCloseAfterCurrentGate(session, drainTimeoutMs)
+        ? await beginSessionCloseAfterCurrentGate(
+            session,
+            drainTimeoutMs,
+            () => {
+              if (queue?.session === session) queue.admissionClosed = true;
+            },
+          )
         : session.beginClose();
       // Reject known work before disturbing any active turn. The close gate
       // prevents new turns, but a turn that was already running can still settle
@@ -4906,7 +4986,7 @@ class QwenAgent implements Agent {
       // is an optimization rather than the final authorization.
       if (opts?.onlyIfUnheld) {
         const holds = session.collectActiveWorkHolds();
-        if (holds.length > 0) {
+        if (holds.length > 0 || session.hasConditionalCloseBlocker()) {
           return { closed: false, holds };
         }
       }
@@ -5003,14 +5083,7 @@ class QwenAgent implements Agent {
       if (blockedByHolds) return blockedByHolds;
     } finally {
       if (!removedFromStore) {
-        cancelClose?.();
-        if (
-          this.promptQueues.get(sessionId) === queue &&
-          queue &&
-          !queue.invalidated
-        ) {
-          queue.admissionClosed = false;
-        }
+        this.releaseSessionCloseGate(sessionId, session, queue, cancelClose);
       }
     }
     return { closed: true, holds: [] };
@@ -6194,7 +6267,12 @@ class QwenAgent implements Agent {
     }
     const sanitizedParams = { ...params, sessionId };
     const queue = this.promptQueues.get(sessionId);
-    if (!queue || queue.session !== session || queue.admissionClosed) {
+    if (
+      this.managedShuttingDown ||
+      !queue ||
+      queue.session !== session ||
+      queue.admissionClosed
+    ) {
       throw RequestError.invalidParams(
         undefined,
         'Session is closing or unavailable for prompt admission',
@@ -6293,7 +6371,7 @@ class QwenAgent implements Agent {
       );
     }
     const promptId = invocationContext?.promptId ?? randomUUID();
-    if (!isValidPromptQueueServerId(promptId)) {
+    if (!isValidPromptQueuePromptId(promptId)) {
       throw RequestError.invalidParams(
         undefined,
         'Invalid trusted prompt queue id',
@@ -8749,7 +8827,7 @@ class QwenAgent implements Agent {
             'Invalid or missing sessionId',
           );
         }
-        if (!isValidPromptQueueServerId(promptId)) {
+        if (!isValidPromptQueuePromptId(promptId)) {
           throw RequestError.invalidParams(undefined, 'Invalid promptId');
         }
         const session = this.sessions.get(sessionId);
@@ -8774,11 +8852,15 @@ class QwenAgent implements Agent {
       }
       case PROMPT_CANCEL_METHOD: {
         const sessionId = params['sessionId'];
+        const promptId = params['promptId'];
         if (typeof sessionId !== 'string' || sessionId.length === 0) {
           throw RequestError.invalidParams(
             undefined,
             'Invalid or missing sessionId',
           );
+        }
+        if (!isValidPromptQueuePromptId(promptId)) {
+          throw RequestError.invalidParams(undefined, 'Invalid promptId');
         }
         const session = this.sessions.get(sessionId);
         if (!session) {
@@ -8789,7 +8871,9 @@ class QwenAgent implements Agent {
         }
         const running = this.promptQueues
           .get(sessionId)
-          ?.entries.find((entry) => entry.state === 'running');
+          ?.entries.find(
+            (entry) => entry.state === 'running' && entry.promptId === promptId,
+          );
         if (!running) {
           return { cancelled: false };
         }

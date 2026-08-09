@@ -6,6 +6,7 @@
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
+import { getEventListeners } from 'node:events';
 import { promises as fsp } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -12008,6 +12009,24 @@ describe('createAcpSessionBridge', () => {
           session.sessionId,
           {
             sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'invalid correlation id' }],
+          },
+          undefined,
+          {
+            clientId: session.clientId,
+            promptId: 'x'.repeat(129),
+          },
+        ),
+      ).toThrow(
+        'Bridge promptId must be a non-empty string of at most 128 characters',
+      );
+      expect(handle.agent.promptCalls).toHaveLength(0);
+
+      expect(() =>
+        bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
             prompt: [{ type: 'text', text: 'invalid internal prompt' }],
           },
           undefined,
@@ -15163,6 +15182,7 @@ describe('createAcpSessionBridge', () => {
       expect(bridge.removePendingPrompt(session.sessionId, 'prompt-b')).toEqual(
         { removed: true },
       );
+      expect(bridge.pendingPromptTotal).toBe(0);
       // B's terminal arrives immediately — while A is still running — as a
       // turn_complete{stopReason:'cancelled'} keyed to B's promptId.
       await vi.waitFor(() => {
@@ -15235,6 +15255,7 @@ describe('createAcpSessionBridge', () => {
         { promptId: 'prompt-wedged', deadlineMs: 50 },
       );
       await expect(p1).rejects.toBeInstanceOf(PromptDeadlineExceededError);
+      expect(bridge.getPendingPrompts(session.sessionId)).toEqual([]);
 
       await vi.waitFor(() => {
         const terms = terminalsFor(events, 'prompt-wedged');
@@ -15253,6 +15274,19 @@ describe('createAcpSessionBridge', () => {
       await vi.waitFor(() => {
         expect(handle.agent.cancelCalls.length).toBeGreaterThan(0);
       });
+      const cancelCallCount = handle.agent.cancelCalls.length;
+      const cancelExtensionCallCount = handle.agent.extMethodCalls.filter(
+        (call) => call.method === PROMPT_CANCEL_METHOD,
+      ).length;
+      await expect(
+        bridge.cancelSession(session.sessionId),
+      ).resolves.toBeUndefined();
+      expect(handle.agent.cancelCalls).toHaveLength(cancelCallCount);
+      expect(
+        handle.agent.extMethodCalls.filter(
+          (call) => call.method === PROMPT_CANCEL_METHOD,
+        ),
+      ).toHaveLength(cancelExtensionCallCount);
       // The caller is terminal, but the executor still owns the FIFO.
       const followup = bridge.sendPrompt(
         session.sessionId,
@@ -15313,6 +15347,25 @@ describe('createAcpSessionBridge', () => {
       const terms = terminalsFor(events, 'prompt-fast');
       expect(terms).toHaveLength(1);
       expect(terms[0]?.type).toBe('turn_complete');
+      await bridge.shutdown();
+    });
+
+    it('detaches a reusable caller abort signal after prompt settlement', async () => {
+      const handle = makeChannel();
+      const bridge = makeBridge({ channelFactory: async () => handle.channel });
+      const session = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+      const callerAbort = new AbortController();
+
+      await bridge.sendPrompt(
+        session.sessionId,
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: 'text', text: 'fast' }],
+        },
+        callerAbort.signal,
+      );
+
+      expect(getEventListeners(callerAbort.signal, 'abort')).toHaveLength(0);
       await bridge.shutdown();
     });
 
@@ -15911,6 +15964,209 @@ describe('createAcpSessionBridge', () => {
       await bridge.shutdown();
     });
 
+    it('bounds a hung cancel handshake after the child prompt settles', async () => {
+      const firstPromptEntered = deferred<void>();
+      const finishFirstPrompt = deferred<PromptResponse>();
+      const handle = makeChannel({
+        promptImpl: async (request) => {
+          const text = (request.prompt[0] as { text?: string }).text;
+          if (text === 'first') {
+            firstPromptEntered.resolve(undefined);
+            return finishFirstPrompt.promise;
+          }
+          return { stopReason: 'end_turn' };
+        },
+        cancelImpl: () => new Promise<void>(() => {}),
+      });
+      const bridge = makeBridge({ channelFactory: async () => handle.channel });
+      const session = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+      const first = bridge.sendPrompt(
+        session.sessionId,
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: 'text', text: 'first' }],
+        },
+        undefined,
+        { promptId: 'prompt-first', deadlineMs: 80 },
+      );
+      await firstPromptEntered.promise;
+      const second = bridge.sendPrompt(
+        session.sessionId,
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: 'text', text: 'second' }],
+        },
+        undefined,
+        { promptId: 'prompt-second' },
+      );
+
+      const cancel = bridge.cancelSession(session.sessionId);
+      await vi.waitFor(() => {
+        expect(handle.agent.cancelCalls.length).toBeGreaterThan(0);
+      });
+      finishFirstPrompt.resolve({ stopReason: 'cancelled' });
+      await expect(first).resolves.toEqual({ stopReason: 'cancelled' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(handle.agent.promptCalls).toHaveLength(1);
+
+      await expect(cancel).resolves.toBeUndefined();
+      await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
+      expect(handle.agent.promptCalls).toHaveLength(2);
+      await bridge.shutdown();
+    });
+
+    it('bounds a prompt-correlated cancel handshake without a caller deadline', async () => {
+      vi.useFakeTimers();
+      const firstPromptEntered = deferred<void>();
+      const finishFirstPrompt = deferred<PromptResponse>();
+      const handle = makeChannel({
+        promptImpl: async (request) => {
+          const text = (request.prompt[0] as { text?: string }).text;
+          if (text === 'first') {
+            firstPromptEntered.resolve(undefined);
+            return finishFirstPrompt.promise;
+          }
+          return { stopReason: 'end_turn' };
+        },
+        cancelImpl: () => new Promise<void>(() => {}),
+      });
+      const bridge = makeBridge({ channelFactory: async () => handle.channel });
+      try {
+        const session = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+        const first = bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'first' }],
+          },
+          undefined,
+          { promptId: 'prompt-first' },
+        );
+        await firstPromptEntered.promise;
+        const second = bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'second' }],
+          },
+          undefined,
+          { promptId: 'prompt-second' },
+        );
+
+        const cancel = bridge.cancelSession(session.sessionId);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(handle.agent.extMethodCalls).toContainEqual({
+          method: PROMPT_CANCEL_METHOD,
+          params: {
+            sessionId: session.sessionId,
+            promptId: 'prompt-first',
+          },
+        });
+        finishFirstPrompt.resolve({ stopReason: 'cancelled' });
+        await expect(first).resolves.toEqual({ stopReason: 'cancelled' });
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(handle.agent.promptCalls).toHaveLength(1);
+
+        await vi.advanceTimersByTimeAsync(1);
+        await expect(cancel).resolves.toBeUndefined();
+        await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
+        expect(handle.agent.promptCalls).toHaveLength(2);
+      } finally {
+        vi.useRealTimers();
+        await bridge.shutdown();
+      }
+    });
+
+    it('keeps FIFO fenced until a timed-out standard cancel write settles', async () => {
+      vi.useFakeTimers();
+      const firstPromptEntered = deferred<void>();
+      const finishFirstPrompt = deferred<PromptResponse>();
+      const releaseFallbackWrite = deferred<void>();
+      const handle = makeChannel({
+        promptCancelExtension: false,
+        promptImpl: async (request) => {
+          const text = (request.prompt[0] as { text?: string }).text;
+          if (text === 'first') {
+            firstPromptEntered.resolve(undefined);
+            return finishFirstPrompt.promise;
+          }
+          return { stopReason: 'end_turn' };
+        },
+      });
+      const originalWritable = handle.channel.stream.writable;
+      const delayedWritable = new WritableStream({
+        async write(message) {
+          const record = message as Record<string, unknown>;
+          if (record['method'] === 'session/cancel') {
+            await releaseFallbackWrite.promise;
+          }
+          const writer = originalWritable.getWriter();
+          try {
+            await writer.write(message);
+          } finally {
+            writer.releaseLock();
+          }
+        },
+      }) as typeof originalWritable;
+      handle.channel = {
+        ...handle.channel,
+        stream: {
+          ...handle.channel.stream,
+          writable: delayedWritable,
+        },
+      };
+      const bridge = makeBridge({ channelFactory: async () => handle.channel });
+      try {
+        const session = await bridge.spawnOrAttach({ workspaceCwd: WS_A });
+        const first = bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'first' }],
+          },
+          undefined,
+          { promptId: 'prompt-first' },
+        );
+        await firstPromptEntered.promise;
+        const second = bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'second' }],
+          },
+          undefined,
+          { promptId: 'prompt-second' },
+        );
+
+        const cancel = bridge.cancelSession(session.sessionId);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(handle.agent.cancelCalls).toHaveLength(0);
+        finishFirstPrompt.resolve({ stopReason: 'cancelled' });
+        await expect(first).resolves.toEqual({ stopReason: 'cancelled' });
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(cancel).resolves.toBeUndefined();
+        expect(handle.agent.promptCalls).toHaveLength(1);
+        expect(handle.agent.cancelCalls).toHaveLength(0);
+        expect(
+          bridge
+            .getPendingPrompts(session.sessionId)
+            .find((pending) => pending.promptId === 'prompt-second')?.state,
+        ).toBe('queued');
+
+        releaseFallbackWrite.resolve(undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
+        expect(handle.agent.promptCalls).toHaveLength(2);
+        expect(handle.agent.cancelCalls).toEqual([
+          { sessionId: session.sessionId },
+        ]);
+      } finally {
+        vi.useRealTimers();
+        await bridge.shutdown();
+      }
+    });
+
     it('releases cancellation and queued work when the channel exits during the handshake', async () => {
       const firstPromptEntered = deferred<void>();
       const handle = makeChannel({
@@ -15952,7 +16208,10 @@ describe('createAcpSessionBridge', () => {
       await vi.waitFor(() => {
         expect(handle.agent.extMethodCalls).toContainEqual({
           method: PROMPT_CANCEL_METHOD,
-          params: { sessionId: session.sessionId },
+          params: {
+            sessionId: session.sessionId,
+            promptId: 'prompt-first',
+          },
         });
       });
       handle.crash({ exitCode: 1, signalCode: null });
@@ -15995,7 +16254,10 @@ describe('createAcpSessionBridge', () => {
       expect(handle.agent.extMethodCalls).toEqual([
         {
           method: PROMPT_CANCEL_METHOD,
-          params: { sessionId: session.sessionId },
+          params: {
+            sessionId: session.sessionId,
+            promptId: 'prompt-standard-cancel',
+          },
         },
       ]);
       expect(handle.agent.cancelCalls).toEqual([

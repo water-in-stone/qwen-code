@@ -19,7 +19,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { NOT_CURRENTLY_GENERATING_CANCEL_MESSAGE } from '@qwen-code/acp-bridge/bridgeErrors';
 import {
+  PENDING_PROMPT_ADDED_EVENT,
+  PENDING_PROMPT_COMPLETED_EVENT,
+  PENDING_PROMPT_STARTED_EVENT,
   PROMPT_QUEUE_LIST_METHOD,
+  PROMPT_QUEUE_NOTIFICATION_METHOD,
   PROMPT_QUEUE_REMOVE_METHOD,
 } from '@qwen-code/acp-bridge/promptQueueProtocol';
 import { ACP_EVENT_LOOP_STALL_RESTART_MS } from '@qwen-code/channel-base';
@@ -842,6 +846,8 @@ vi.mock('./session/Session.js', () => {
   // The agent's active-work reporter walks every live Session on a timer, so
   // even tests that never look at reporting need this to exist on instances.
   SessionMock.prototype.collectActiveWorkHolds = () => [];
+  SessionMock.prototype.hasConditionalCloseBlocker = () => false;
+  SessionMock.prototype.isClosing = () => false;
   return {
     Session: SessionMock,
     buildAvailableCommandsSnapshot: vi.fn().mockResolvedValue({
@@ -972,6 +978,7 @@ import {
 } from '../utils/languageUtils.js';
 import { buildAuthMethods } from './authMethods.js';
 import {
+  ACTIVE_WORK_CLOSE_IF_UNHELD_PARAM,
   ACTIVE_WORK_HEARTBEAT_META_KEY,
   ACTIVE_WORK_HEARTBEAT_MIN_INTERVAL_MS,
   ACTIVE_WORK_HEARTBEAT_VERSION,
@@ -1992,12 +1999,14 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         rewindToTurn: ReturnType<typeof vi.fn>;
         beginHistoryMutation: ReturnType<typeof vi.fn>;
         hasHistoryMutationOwner: ReturnType<typeof vi.fn>;
+        hasConditionalCloseBlocker: ReturnType<typeof vi.fn>;
         getRewindableUserTurnCount: ReturnType<typeof vi.fn>;
         clearActiveTodoPlanRevision: ReturnType<typeof vi.fn>;
         clearTodoStopGuardTrust: ReturnType<typeof vi.fn>;
         hardSuspendTodoStopGuard: ReturnType<typeof vi.fn>;
         beginClose: ReturnType<typeof vi.fn>;
         beginCloseIfAvailable: ReturnType<typeof vi.fn>;
+        isClosing: ReturnType<typeof vi.fn>;
         waitForActiveTurnsToSettle: ReturnType<typeof vi.fn>;
         cancelPendingPrompt: ReturnType<typeof vi.fn>;
         enqueueBackgroundNotification: ReturnType<typeof vi.fn>;
@@ -2191,10 +2200,12 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       { privateParentCapability: 'expected-capability' },
     );
     await vi.waitFor(() => expect(capturedAgentFactory).toBeDefined());
+    const extNotification = vi.fn().mockResolvedValue(undefined);
     const agent = capturedAgentFactory!({
       get closed() {
         return mockConnectionState.promise;
       },
+      extNotification,
     }) as AgentLike;
     await agent.initialize({
       clientCapabilities: {},
@@ -2206,7 +2217,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     const invocation = {
       version: 1,
       sessionId: 'trusted-session',
-      promptId: '550e8400-e29b-41d4-a716-446655440000',
+      promptId: 'prompt-1',
       originatorClientId: 'trusted-client',
     };
 
@@ -2291,7 +2302,11 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         prompt: [{ type: 'text', text: 'hello' }],
         _meta: { keep: true },
       },
-      undefined,
+      {
+        version: 1,
+        sessionId: 'untrusted-session',
+        promptId: expect.any(String),
+      },
       expect.any(AbortSignal),
       undefined,
     );
@@ -2375,6 +2390,172 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     ).rejects.toMatchObject({
       code: -32023,
       data: { errorKind: 'session_writer_unavailable' },
+    });
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('refuses conditional idle close while an automatic boundary is deferred', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootInitializedAcpAgent(
+      makeSessionSettings(),
+      'expected-capability',
+    );
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    const releaseCloseGate = vi.fn();
+    lastSessionMock!.beginClose.mockReturnValueOnce(releaseCloseGate);
+    lastSessionMock!.hasConditionalCloseBlocker.mockReturnValueOnce(true);
+
+    await expect(
+      agent.extMethod(SERVE_CONTROL_EXT_METHODS.sessionClose, {
+        sessionId,
+        [ACTIVE_WORK_CLOSE_IF_UNHELD_PARAM]: true,
+      }),
+    ).resolves.toEqual({ sessionId, closed: false, holds: [] });
+    expect(lastSessionMock!.collectActiveWorkHolds).toHaveBeenCalledOnce();
+    expect(lastSessionMock!.cancelPendingPrompt).not.toHaveBeenCalled();
+    expect(releaseCloseGate).toHaveBeenCalledOnce();
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('keeps a refused conditional close gated when managed shutdown races it', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootInitializedAcpAgent(
+      makeSessionSettings(),
+      'expected-capability',
+    );
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    let closeGateHeld = false;
+    let shutdown:
+      | { configs: Config[]; writerShutdown: Promise<void> }
+      | undefined;
+    const acquireCloseGate = () => {
+      if (closeGateHeld) throw new Error('Session is closing');
+      closeGateHeld = true;
+      shutdown ??= agent.beginManagedShutdown();
+      return () => {
+        closeGateHeld = false;
+      };
+    };
+    lastSessionMock!.beginClose.mockImplementation(acquireCloseGate);
+    lastSessionMock!.beginCloseIfAvailable.mockImplementation(() =>
+      closeGateHeld ? null : acquireCloseGate(),
+    );
+    lastSessionMock!.hasConditionalCloseBlocker.mockReturnValueOnce(true);
+
+    await expect(
+      agent.extMethod(SERVE_CONTROL_EXT_METHODS.sessionClose, {
+        sessionId,
+        [ACTIVE_WORK_CLOSE_IF_UNHELD_PARAM]: true,
+      }),
+    ).resolves.toEqual({ sessionId, closed: false, holds: [] });
+    expect(shutdown).toBeDefined();
+    expect(lastSessionMock!.beginCloseIfAvailable).toHaveBeenCalledTimes(2);
+    expect(closeGateHeld).toBe(true);
+    await expect(agent.prompt({ sessionId, prompt: [] })).rejects.toThrow(
+      'Session is closing or unavailable for prompt admission',
+    );
+    await shutdown!.writerShutdown;
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('closes direct prompt admission and cancels queued work on managed shutdown', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootInitializedAcpAgent(
+      makeSessionSettings(),
+      'expected-capability',
+    );
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    lastSessionMock?.prompt.mockImplementationOnce(
+      async (
+        _params: unknown,
+        _invocationContext: unknown,
+        signal?: AbortSignal,
+      ) =>
+        new Promise<{ stopReason: 'cancelled' }>((resolve) => {
+          const finish = () => resolve({ stopReason: 'cancelled' });
+          if (signal?.aborted) finish();
+          else signal?.addEventListener('abort', finish, { once: true });
+        }),
+    );
+
+    const first = agent.prompt({ sessionId, prompt: [] });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
+    );
+    const second = agent.prompt({ sessionId, prompt: [] });
+    const shutdown = agent.beginManagedShutdown();
+
+    await expect(first).resolves.toEqual({ stopReason: 'cancelled' });
+    await expect(second).resolves.toEqual({ stopReason: 'cancelled' });
+    expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1);
+    await expect(agent.prompt({ sessionId, prompt: [] })).rejects.toThrow(
+      'Session is closing or unavailable for prompt admission',
+    );
+    await shutdown.writerShutdown;
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('waits for cancelled prompt cleanup before closing managed writers', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    const innerConfig = await setupSessionMocks(sessionId);
+    const { agent, agentPromise } = await bootInitializedAcpAgent(
+      makeSessionSettings(),
+      'expected-capability',
+    );
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => {
+      markAborted = resolve;
+    });
+    let releaseCleanup!: () => void;
+    const cleanup = new Promise<void>((resolve) => {
+      releaseCleanup = resolve;
+    });
+    lastSessionMock!.prompt.mockImplementationOnce(
+      async (
+        _params: unknown,
+        _invocationContext: unknown,
+        signal?: AbortSignal,
+      ) => {
+        markStarted();
+        if (!signal?.aborted) {
+          await new Promise<void>((resolve) => {
+            signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+        }
+        markAborted();
+        await cleanup;
+        return { stopReason: 'cancelled' };
+      },
+    );
+
+    const prompt = agent.prompt({ sessionId, prompt: [] });
+    await started;
+    const shutdown = agent.beginManagedShutdown();
+    await aborted;
+    await Promise.resolve();
+    expect(innerConfig.closeSessionWriter).not.toHaveBeenCalled();
+
+    releaseCleanup();
+    await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' });
+    await shutdown.writerShutdown;
+    expect(innerConfig.closeSessionWriter).toHaveBeenCalledWith({
+      handoff: true,
     });
 
     mockConnectionState.resolve();
@@ -3967,6 +4148,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         startCronScheduler: vi.fn(),
         beginClose: vi.fn().mockReturnValue(vi.fn()),
         beginCloseIfAvailable: vi.fn().mockReturnValue(vi.fn()),
+        isClosing: vi.fn().mockReturnValue(false),
         waitForCloseGateToRelease: vi.fn().mockResolvedValue(undefined),
         waitForActiveTurnsToSettle: vi.fn().mockResolvedValue(undefined),
         cancelPendingPrompt: vi.fn().mockResolvedValue(undefined),
@@ -3991,6 +4173,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           .mockReturnValue({ targetTurnIndex: 1, apiTruncateIndex: 2 }),
         beginHistoryMutation: vi.fn().mockImplementation(() => vi.fn()),
         hasHistoryMutationOwner: vi.fn().mockReturnValue(false),
+        hasConditionalCloseBlocker: vi.fn().mockReturnValue(false),
         getRewindableUserTurnCount: vi.fn().mockReturnValue(1),
         clearActiveTodoPlanRevision: vi.fn(),
         clearTodoStopGuardTrust: vi.fn(),
@@ -4013,13 +4196,14 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       mockArgv,
     );
     await vi.waitFor(() => expect(capturedAgentFactory).toBeDefined());
+    const extNotification = vi.fn().mockResolvedValue(undefined);
     const agent = capturedAgentFactory!({
       get closed() {
         return mockConnectionState.promise;
       },
-      extNotification: vi.fn().mockResolvedValue(undefined),
+      extNotification,
     }) as AgentLike;
-    return { agent, agentPromise };
+    return { agent, agentPromise, extNotification };
   }
 
   async function bootInitializedAcpAgent(
@@ -4032,10 +4216,12 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         })
       : runAcpAgent(mockConfig, settings, mockArgv);
     await vi.waitFor(() => expect(capturedAgentFactory).toBeDefined());
+    const extNotification = vi.fn().mockResolvedValue(undefined);
     const agent = capturedAgentFactory!({
       get closed() {
         return mockConnectionState.promise;
       },
+      extNotification,
     }) as AgentLike;
     await agent.initialize({
       clientCapabilities: {},
@@ -4047,7 +4233,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           }
         : {}),
     });
-    return { agent, agentPromise };
+    return { agent, agentPromise, extNotification };
   }
 
   async function withEmptyTrustedFolders<T>(
@@ -4284,10 +4470,28 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     const cancellationSignal = lastSessionMock?.prompt.mock.calls[0]?.[2] as
       | AbortSignal
       | undefined;
+    const listed = await agent.extMethod(PROMPT_QUEUE_LIST_METHOD, {
+      sessionId,
+    });
+    const promptId = (
+      listed['pendingPrompts'] as Array<{ promptId: string }>
+    )[0]!.promptId;
+    const stalePromptId = `${promptId.slice(0, -1)}${
+      promptId.endsWith('0') ? '1' : '0'
+    }`;
+
+    await expect(
+      agent.extMethod(PROMPT_CANCEL_METHOD, {
+        sessionId,
+        promptId: stalePromptId,
+      }),
+    ).resolves.toEqual({ cancelled: false });
+    expect(cancellationSignal?.aborted).toBe(false);
+    expect(lastSessionMock?.cancelPendingPrompt).not.toHaveBeenCalled();
 
     let cancellationSettled = false;
     const cancellation = agent
-      .extMethod(PROMPT_CANCEL_METHOD, { sessionId })
+      .extMethod(PROMPT_CANCEL_METHOD, { sessionId, promptId })
       .finally(() => {
         cancellationSettled = true;
       });
@@ -4310,7 +4514,10 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     await agent.newSession({ cwd: '/tmp', mcpServers: [] });
 
     await expect(
-      agent.extMethod(PROMPT_CANCEL_METHOD, { sessionId }),
+      agent.extMethod(PROMPT_CANCEL_METHOD, {
+        sessionId,
+        promptId: '550e8400-e29b-41d4-a716-446655440000',
+      }),
     ).resolves.toEqual({ cancelled: false });
     expect(lastSessionMock?.cancelPendingPrompt).not.toHaveBeenCalled();
 
@@ -4397,6 +4604,113 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     );
     await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
     expect(abortedAtEntry).toEqual([false, false]);
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('publishes exact direct-queue lifecycle events for completion and removal', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    await setupSessionMocks(sessionId);
+    const { agent, agentPromise, extNotification } = await bootAcpAgent();
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    lastSessionMock?.prompt
+      .mockImplementationOnce(async () => {
+        await firstGate;
+        return { stopReason: 'end_turn' };
+      })
+      .mockResolvedValueOnce({ stopReason: 'end_turn' });
+    const first = agent.prompt({ sessionId, prompt: [] });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(1),
+    );
+    const second = agent.prompt({
+      sessionId,
+      prompt: [{ type: 'text', text: 'queued-completion' }],
+      _meta: {
+        qwen: { promptQueue: { clientPromptId: 'client-completion' } },
+      },
+    });
+    releaseFirst();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { stopReason: 'end_turn' },
+      { stopReason: 'end_turn' },
+    ]);
+
+    const completionEvents = extNotification.mock.calls
+      .filter(([method]) => method === PROMPT_QUEUE_NOTIFICATION_METHOD)
+      .map(([, params]) => params as Record<string, unknown>);
+    expect(completionEvents.map((event) => event['kind'])).toEqual([
+      PENDING_PROMPT_ADDED_EVENT,
+      PENDING_PROMPT_STARTED_EVENT,
+      PENDING_PROMPT_COMPLETED_EVENT,
+    ]);
+    for (const event of completionEvents) {
+      expect(event['data']).toMatchObject({
+        version: 1,
+        clientPromptId: 'client-completion',
+      });
+    }
+    const completedPromptIds = completionEvents.map(
+      (event) => (event['data'] as { promptId: string }).promptId,
+    );
+    expect(new Set(completedPromptIds).size).toBe(1);
+
+    extNotification.mockClear();
+    let releaseThird!: () => void;
+    const thirdGate = new Promise<void>((resolve) => {
+      releaseThird = resolve;
+    });
+    lastSessionMock?.prompt.mockImplementationOnce(async () => {
+      await thirdGate;
+      return { stopReason: 'end_turn' };
+    });
+    const third = agent.prompt({ sessionId, prompt: [] });
+    await vi.waitFor(() =>
+      expect(lastSessionMock?.prompt).toHaveBeenCalledTimes(3),
+    );
+    const fourth = agent.prompt({
+      sessionId,
+      prompt: [{ type: 'text', text: 'queued-removal' }],
+      _meta: { qwen: { promptQueue: { clientPromptId: 'client-removal' } } },
+    });
+    const listed = await agent.extMethod(PROMPT_QUEUE_LIST_METHOD, {
+      sessionId,
+    });
+    const removedPromptId = (
+      listed['pendingPrompts'] as Array<{
+        promptId: string;
+        clientPromptId?: string;
+      }>
+    ).find((entry) => entry.clientPromptId === 'client-removal')!.promptId;
+    await expect(
+      agent.extMethod(PROMPT_QUEUE_REMOVE_METHOD, {
+        sessionId,
+        promptId: removedPromptId,
+      }),
+    ).resolves.toEqual({ removed: true });
+    await expect(fourth).resolves.toEqual({ stopReason: 'cancelled' });
+    releaseThird();
+    await expect(third).resolves.toEqual({ stopReason: 'end_turn' });
+
+    const removalEvents = extNotification.mock.calls
+      .filter(([method]) => method === PROMPT_QUEUE_NOTIFICATION_METHOD)
+      .map(([, params]) => params as Record<string, unknown>);
+    expect(removalEvents.map((event) => event['kind'])).toEqual([
+      PENDING_PROMPT_ADDED_EVENT,
+      PENDING_PROMPT_COMPLETED_EVENT,
+    ]);
+    expect(removalEvents[1]?.['data']).toMatchObject({
+      version: 1,
+      promptId: removedPromptId,
+      clientPromptId: 'client-removal',
+      state: 'removed',
+    });
 
     mockConnectionState.resolve();
     await agentPromise;
@@ -14544,6 +14858,7 @@ describe('QwenAgent extMethod renameSession routing', () => {
           cancelPendingPrompt: liveCancelPendingPrompt,
           beginClose: liveBeginClose,
           beginCloseIfAvailable: liveBeginCloseIfAvailable,
+          isClosing: vi.fn().mockReturnValue(false),
           waitForCloseGateToRelease: liveWaitForCloseGateToRelease,
           waitForActiveTurnsToSettle: liveWaitForActiveTurnsToSettle,
           isIdle: liveIsIdle,
@@ -15858,7 +16173,10 @@ describe('QwenAgent unstable_listSessions cursor parsing', () => {
 // resume does not).
 describe('QwenAgent loadSession / unstable_resumeSession', () => {
   let capturedAgentFactory:
-    | ((conn: { closed: Promise<void> }) => {
+    | ((conn: {
+        closed: Promise<void>;
+        extNotification?: ReturnType<typeof vi.fn>;
+      }) => {
         initialize: (args: Record<string, unknown>) => Promise<unknown>;
         loadSession: (args: Record<string, unknown>) => Promise<unknown>;
         unstable_resumeSession: (
@@ -15869,12 +16187,14 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
           writerShutdown: Promise<void>;
         };
         cancel: (args: Record<string, unknown>) => Promise<unknown>;
+        prompt: (args: Record<string, unknown>) => Promise<unknown>;
       })
     | undefined;
 
   let mockConfig: Config;
   let lastSessionMock:
     | {
+        sessionId: string;
         getId: ReturnType<typeof vi.fn>;
         getConfig: ReturnType<typeof vi.fn>;
         sendAvailableCommandsUpdate: ReturnType<typeof vi.fn>;
@@ -15896,9 +16216,13 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
         assertCanStartTurn: ReturnType<typeof vi.fn>;
         beginClose: ReturnType<typeof vi.fn>;
         beginCloseIfAvailable: ReturnType<typeof vi.fn>;
+        isClosing: ReturnType<typeof vi.fn>;
         waitForCloseGateToRelease: ReturnType<typeof vi.fn>;
         waitForActiveTurnsToSettle: ReturnType<typeof vi.fn>;
         cancelPendingPrompt: ReturnType<typeof vi.fn>;
+        hasHistoryMutationOwner: ReturnType<typeof vi.fn>;
+        hasConditionalCloseBlocker: ReturnType<typeof vi.fn>;
+        prompt: ReturnType<typeof vi.fn>;
         sendUpdate: ReturnType<typeof vi.fn>;
         dispose: ReturnType<typeof vi.fn>;
       }
@@ -15952,8 +16276,8 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       getModelsConfig: vi.fn().mockReturnValue({
         getCurrentAuthType: vi.fn().mockReturnValue('api-key'),
       }),
-      refreshAuth: vi.fn().mockResolvedValue(undefined),
       closeSessionWriter: vi.fn().mockResolvedValue(undefined),
+      refreshAuth: vi.fn().mockResolvedValue(undefined),
       getWorkspaceContext: vi.fn().mockReturnValue({}),
       getDebugMode: vi.fn().mockReturnValue(false),
     } as unknown as Config;
@@ -16233,6 +16557,7 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
     vi.mocked(Session).mockImplementation(() => {
       const releaseCloseGate = vi.fn();
       const sessionMock = {
+        sessionId: 'persisted-1',
         getId: vi.fn().mockReturnValue('persisted-1'),
         getConfig: vi.fn().mockReturnValue(innerConfig),
         sendAvailableCommandsUpdate: vi.fn().mockResolvedValue(undefined),
@@ -16257,6 +16582,7 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
         enableLiveScreenContext: vi.fn().mockResolvedValue(undefined),
         beginClose: vi.fn().mockReturnValue(releaseCloseGate),
         beginCloseIfAvailable: vi.fn().mockReturnValue(releaseCloseGate),
+        isClosing: vi.fn().mockReturnValue(false),
         waitForCloseGateToRelease: vi.fn().mockResolvedValue(undefined),
         waitForActiveTurnsToSettle: vi.fn().mockResolvedValue(undefined),
         cancelPendingPrompt: vi.fn().mockResolvedValue(undefined),
@@ -16264,6 +16590,9 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
         sendUpdate: opts.recoveredGoalSendError
           ? vi.fn().mockRejectedValue(opts.recoveredGoalSendError)
           : vi.fn().mockResolvedValue(undefined),
+        hasHistoryMutationOwner: vi.fn().mockReturnValue(false),
+        hasConditionalCloseBlocker: vi.fn().mockReturnValue(false),
+        prompt: vi.fn().mockResolvedValue({ stopReason: 'end_turn' }),
         clearActiveTodoPlanRevision: vi.fn(),
         dispose: vi.fn(),
       };
@@ -16285,6 +16614,7 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       get closed() {
         return mockConnectionState.promise;
       },
+      extNotification: vi.fn().mockResolvedValue(undefined),
     });
     if (privateParentCapability) {
       await agent.initialize({
@@ -17022,11 +17352,15 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       ).sendUpdate(replayUpdate);
     });
     const liveSession = {
+      sessionId: 'persisted-1',
       getId: vi.fn().mockReturnValue('persisted-1'),
       getConfig: vi.fn().mockReturnValue(innerConfig),
       assertCanStartTurn: vi.fn().mockResolvedValue(undefined),
       beginClose: vi.fn().mockReturnValue(vi.fn()),
+      beginCloseIfAvailable: vi.fn().mockReturnValue(vi.fn()),
+      isClosing: vi.fn().mockReturnValue(false),
       waitForActiveTurnsToSettle: vi.fn().mockResolvedValue(undefined),
+      hasConditionalCloseBlocker: vi.fn().mockReturnValue(false),
       sendUpdate: vi.fn().mockResolvedValue(undefined),
       clearActiveTodoPlanRevision: vi.fn(),
     };
@@ -17035,6 +17369,11 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       'persisted-1',
       liveSession,
     );
+    (
+      agent as unknown as {
+        createPromptQueueState: (session: unknown) => void;
+      }
+    ).createPromptQueueState(liveSession);
 
     await agent.loadSession({
       cwd: '/tmp',
@@ -18034,6 +18373,7 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       getConfig: vi.fn().mockReturnValue(replacementConfig),
       beginClose: vi.fn().mockReturnValue(vi.fn()),
       beginCloseIfAvailable: vi.fn().mockReturnValue(vi.fn()),
+      isClosing: vi.fn().mockReturnValue(false),
       waitForCloseGateToRelease: vi.fn().mockResolvedValue(undefined),
       cancelPendingPrompt: vi.fn().mockResolvedValue(undefined),
       waitForActiveTurnsToSettle: vi.fn().mockResolvedValue(undefined),
@@ -18112,6 +18452,199 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
     expect(firstSession!.beginClose.mock.results[0]?.value).toHaveBeenCalled();
     expect(firstSession!.sendUpdate).toHaveBeenCalledWith(replayUpdate);
     expect(mockHistoryReplay).toHaveBeenCalledTimes(1);
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('drains accepted FIFO prompts before starting a live load', async () => {
+    bindRestoreMocks({
+      sessionExists: true,
+      resumedConversation: { messages: [] },
+    });
+    const { agent, agentPromise } = await spawnAgent();
+    await agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    const liveSession = lastSessionMock!;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    liveSession.prompt
+      .mockImplementationOnce(async () => {
+        await firstGate;
+        return { stopReason: 'end_turn' };
+      })
+      .mockImplementationOnce(async () => {
+        await secondGate;
+        return { stopReason: 'end_turn' };
+      });
+
+    const first = agent.prompt({ sessionId: 'persisted-1', prompt: [] });
+    await vi.waitFor(() => expect(liveSession.prompt).toHaveBeenCalledOnce());
+    const second = agent.prompt({ sessionId: 'persisted-1', prompt: [] });
+    const reload = agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    await vi.waitFor(() =>
+      expect(liveSession.assertCanStartTurn).toHaveBeenCalledOnce(),
+    );
+    await expect(
+      agent.prompt({ sessionId: 'persisted-1', prompt: [] }),
+    ).rejects.toThrow('Session is closing or unavailable for prompt admission');
+    expect(liveSession.beginClose).not.toHaveBeenCalled();
+
+    releaseFirst();
+    await expect(first).resolves.toEqual({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(liveSession.prompt).toHaveBeenCalledTimes(2));
+    expect(liveSession.beginClose).not.toHaveBeenCalled();
+    releaseSecond();
+    await expect(second).resolves.toEqual({ stopReason: 'end_turn' });
+    await expect(reload).resolves.toBeDefined();
+    expect(liveSession.beginClose).toHaveBeenCalledOnce();
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('keeps live-session admission closed when managed shutdown races restore', async () => {
+    const messages = [{ role: 'user', parts: [{ text: 'first' }] }];
+    bindRestoreMocks({
+      sessionExists: true,
+      resumedConversation: { messages },
+    });
+    const { agent, agentPromise } = await spawnAgent();
+    await agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    const liveSession = lastSessionMock!;
+    let closeGateHeld = false;
+    const acquireCloseGate = () => {
+      if (closeGateHeld) throw new Error('Session is closing');
+      closeGateHeld = true;
+      return () => {
+        closeGateHeld = false;
+      };
+    };
+    liveSession.beginClose.mockImplementation(acquireCloseGate);
+    liveSession.beginCloseIfAvailable.mockImplementation(() =>
+      closeGateHeld ? null : acquireCloseGate(),
+    );
+    mockHistoryReplay.mockClear();
+    let releaseReplay!: () => void;
+    const replayGate = new Promise<void>((resolve) => {
+      releaseReplay = resolve;
+    });
+    mockHistoryReplay.mockImplementationOnce(async () => replayGate);
+
+    const reload = agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    await vi.waitFor(() => expect(mockHistoryReplay).toHaveBeenCalledOnce());
+    expect(closeGateHeld).toBe(true);
+    (
+      agent as unknown as {
+        privateParentState: 'trusted';
+      }
+    ).privateParentState = 'trusted';
+    const shutdown = agent.beginManagedShutdown();
+    expect(liveSession.beginCloseIfAvailable).toHaveBeenCalledOnce();
+    let writerSettled = false;
+    void shutdown.writerShutdown.finally(() => {
+      writerSettled = true;
+    });
+    await Promise.resolve();
+    expect(writerSettled).toBe(false);
+    expect(liveSession.getConfig().closeSessionWriter).not.toHaveBeenCalled();
+
+    releaseReplay();
+    await expect(reload).resolves.toBeDefined();
+    expect(liveSession.beginCloseIfAvailable).toHaveBeenCalledTimes(2);
+    expect(closeGateHeld).toBe(true);
+    await expect(
+      agent.prompt({ sessionId: 'persisted-1', prompt: [] }),
+    ).rejects.toThrow('Session is closing or unavailable for prompt admission');
+    await shutdown.writerShutdown;
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('does not reopen live-session admission when a competing close loses the gate', async () => {
+    const messages = [{ role: 'user', parts: [{ text: 'first' }] }];
+    bindRestoreMocks({
+      sessionExists: true,
+      resumedConversation: { messages },
+    });
+    const { agent, agentPromise } = await spawnAgent();
+    await agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    const liveSession = lastSessionMock!;
+    let closeGateHeld = false;
+    const acquireCloseGate = () => {
+      if (closeGateHeld) throw new Error('Session is closing');
+      closeGateHeld = true;
+      return () => {
+        closeGateHeld = false;
+      };
+    };
+    liveSession.beginClose.mockImplementation(acquireCloseGate);
+    liveSession.beginCloseIfAvailable.mockImplementation(() =>
+      closeGateHeld ? null : acquireCloseGate(),
+    );
+    liveSession.isClosing.mockImplementation(() => closeGateHeld);
+    mockHistoryReplay.mockClear();
+    let releaseReplay!: () => void;
+    const replayGate = new Promise<void>((resolve) => {
+      releaseReplay = resolve;
+    });
+    mockHistoryReplay.mockImplementationOnce(async () => replayGate);
+
+    const reload = agent.loadSession({
+      cwd: '/tmp',
+      sessionId: 'persisted-1',
+      mcpServers: [],
+    });
+    await vi.waitFor(() => expect(mockHistoryReplay).toHaveBeenCalledOnce());
+    expect(closeGateHeld).toBe(true);
+
+    await expect(
+      (
+        agent as unknown as {
+          extMethod: (
+            method: string,
+            params: Record<string, unknown>,
+          ) => Promise<unknown>;
+        }
+      ).extMethod(SERVE_CONTROL_EXT_METHODS.sessionClose, {
+        sessionId: 'persisted-1',
+      }),
+    ).rejects.toThrow('Session is closing');
+    await expect(
+      agent.prompt({ sessionId: 'persisted-1', prompt: [] }),
+    ).rejects.toThrow('Session is closing or unavailable for prompt admission');
+
+    releaseReplay();
+    await expect(reload).resolves.toBeDefined();
+    await expect(
+      agent.prompt({ sessionId: 'persisted-1', prompt: [] }),
+    ).resolves.toEqual({ stopReason: 'end_turn' });
 
     mockConnectionState.resolve();
     await agentPromise;

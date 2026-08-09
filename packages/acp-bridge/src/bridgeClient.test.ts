@@ -3009,6 +3009,104 @@ describe('BridgeClient — timed-out executor event fence', () => {
 
     expect(publish).not.toHaveBeenCalled();
   });
+
+  it('blocks every prompt-scoped host handler but allows scheduled delivery', async () => {
+    const sessionId = 'sess:timed-out-handlers';
+    const entry = {
+      sessionId,
+      timedOutExecutorPromptId: 'prompt-expired',
+      events: { publish: vi.fn().mockReturnValue(true) },
+    };
+    const clientMcpSend = vi.fn();
+    const createSubSession = vi.fn();
+    const channelDelivery = vi.fn().mockResolvedValue({ status: 'delivered' });
+    const captureScreen = vi.fn();
+    const liveTask = vi.fn();
+    const speak = vi.fn();
+    const client = new BridgeClient(
+      ((id: string) => (id === sessionId ? entry : undefined)) as never,
+      (() => undefined) as never,
+      { request: vi.fn() } as never,
+      0,
+      Infinity,
+      undefined,
+      undefined,
+      undefined,
+      (() => clientMcpSend) as never,
+      (id) => id === sessionId,
+      undefined,
+      createSubSession as never,
+      undefined,
+      undefined,
+      channelDelivery as never,
+      () => false,
+      () => captureScreen as never,
+      () => liveTask as never,
+      () => speak as never,
+    );
+
+    const calls: Array<[string, Record<string, unknown>]> = [
+      [
+        SERVE_CONTROL_EXT_METHODS.channelDelivery,
+        {
+          sessionId,
+          deliveryId: 'prompt-1',
+          source: 'prompt',
+          target: { channelName: 'dingtalk', type: 'user', id: 'user-1' },
+          text: 'late',
+          promptId: 'prompt-1',
+        },
+      ],
+      [
+        SERVE_CONTROL_EXT_METHODS.clientMcpMessage,
+        {
+          sessionId,
+          server: 'hosted',
+          payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+        },
+      ],
+      [
+        'qwen/control/create-sub-session',
+        { callerSessionId: sessionId, prompt: 'late', completion: 'sent' },
+      ],
+      [
+        SERVE_CONTROL_EXT_METHODS.liveCaptureScreenContext,
+        { callerSessionId: sessionId },
+      ],
+      [
+        SERVE_CONTROL_EXT_METHODS.liveTaskTool,
+        { callerSessionId: sessionId, name: 'list_threads', arguments: {} },
+      ],
+      [
+        SERVE_CONTROL_EXT_METHODS.liveSpeakToUser,
+        { callerSessionId: sessionId, message: 'late' },
+      ],
+    ];
+    for (const [method, params] of calls) {
+      await expect(client.extMethod(method, params)).rejects.toMatchObject({
+        code: -32602,
+      });
+    }
+    expect(clientMcpSend).not.toHaveBeenCalled();
+    expect(createSubSession).not.toHaveBeenCalled();
+    expect(captureScreen).not.toHaveBeenCalled();
+    expect(liveTask).not.toHaveBeenCalled();
+    expect(speak).not.toHaveBeenCalled();
+    expect(channelDelivery).not.toHaveBeenCalled();
+
+    await expect(
+      client.extMethod(SERVE_CONTROL_EXT_METHODS.channelDelivery, {
+        sessionId,
+        deliveryId: 'task-1:123',
+        source: 'scheduled',
+        target: { channelName: 'dingtalk', type: 'user', id: 'user-1' },
+        text: 'scheduled',
+        taskId: 'task-1',
+        firedAt: 123,
+      }),
+    ).resolves.toEqual({ status: 'delivered' });
+    expect(channelDelivery).toHaveBeenCalledOnce();
+  });
 });
 
 describe('BridgeClient — pending interaction classification', () => {
