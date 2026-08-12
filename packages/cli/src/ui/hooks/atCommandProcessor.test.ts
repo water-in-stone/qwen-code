@@ -56,6 +56,20 @@ describe('extractAtPathCommands', () => {
     );
   });
 
+  it('stops a filesystem path at CJK sentence punctuation', () => {
+    expect(
+      extractAtPathCommands(
+        '请处理 @./sample.png，并告诉我图片尺寸。再看 @./clip.mp4；谢谢',
+      ),
+    ).toEqual(['./sample.png', './clip.mp4']);
+
+    for (const punctuation of '，；！？。（）【】｛｝、') {
+      expect(extractAtPathCommands(`@./sample.png${punctuation}继续`)).toEqual([
+        './sample.png',
+      ]);
+    }
+  });
+
   it('strips trailing sentence punctuation from a URL ref', () => {
     const url = 'https://example.com/clip.mp4';
     // ASCII and CJK terminators, and the query-string case where `?` is

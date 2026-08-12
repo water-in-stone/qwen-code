@@ -32,6 +32,7 @@ import { tmpdir, platform } from 'node:os';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
 const cliPackageDir = join(root, 'packages', 'cli');
+const cliTsconfig = join(cliPackageDir, 'tsconfig.json');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8'));
 
 // Ensure qc-helper bundled skill can find user docs in dev mode.
@@ -156,15 +157,18 @@ const tsxCmd = hasLocalTsxCli
     : tsxBinName;
 const tsxArgs = [
   ...(hasLocalTsxCli ? [localTsxCli] : []),
+  '--tsconfig',
+  cliTsconfig,
   cliEntry,
   ...process.argv.slice(2),
 ];
 const useShell = isWin && !hasLocalTsxCli;
+const workingDir = process.env.QWEN_WORKING_DIR || process.cwd();
 
 const child = spawn(tsxCmd, tsxArgs, {
   stdio: 'inherit',
   env,
-  cwd: process.cwd(),
+  cwd: workingDir,
   shell: useShell, // Needed only when falling back to tsx.cmd on Windows.
 });
 

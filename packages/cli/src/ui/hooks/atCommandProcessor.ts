@@ -146,7 +146,7 @@ function parseAllAtCommands(query: string): AtCommandPart[] {
         inEscape = true;
       } else if (isUrlRef) {
         if (NON_URL_CHAR.test(char)) break;
-      } else if (/[,\s;!?()[\]{}]/.test(char)) {
+      } else if (/[,\s;!?()[\]{}，；！？。（）【】｛｝、]/u.test(char)) {
         // Path ends at first whitespace or punctuation not escaped
         break;
       } else if (char === '.') {

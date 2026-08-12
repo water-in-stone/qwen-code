@@ -74,6 +74,8 @@ describe('scripts/dev.js launcher', () => {
     expect(command).toBe('C:\\Program Files\\nodejs\\node.exe');
     expect(args.map(normalizePath)).toEqual([
       expect.stringContaining('node_modules/tsx/dist/cli.mjs'),
+      '--tsconfig',
+      expect.stringContaining('packages/cli/tsconfig.json'),
       expect.stringContaining('packages/cli/index.ts'),
       '--help',
     ]);
@@ -91,9 +93,25 @@ describe('scripts/dev.js launcher', () => {
     const [command, args, options] = spawnMock.mock.calls[0];
     expect(normalizePath(command)).toContain('tsx.cmd');
     expect(args.map(normalizePath)).toEqual([
+      '--tsconfig',
+      expect.stringContaining('packages/cli/tsconfig.json'),
       expect.stringContaining('packages/cli/index.ts'),
     ]);
     expect(options).toEqual(expect.objectContaining({ shell: true }));
+  });
+
+  it('uses QWEN_WORKING_DIR as the CLI workspace', async () => {
+    const inherited = process.env.QWEN_WORKING_DIR;
+    process.env.QWEN_WORKING_DIR = '/tmp/qwen-target-workspace';
+    try {
+      await import('../dev.js?working-directory');
+
+      const [, , options] = spawnMock.mock.calls[0];
+      expect(options.cwd).toBe('/tmp/qwen-target-workspace');
+    } finally {
+      if (inherited === undefined) delete process.env.QWEN_WORKING_DIR;
+      else process.env.QWEN_WORKING_DIR = inherited;
+    }
   });
 
   it('re-raises a child signal instead of exiting 0 — close(null, SIGKILL) is not success', async () => {
