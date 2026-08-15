@@ -1,5 +1,60 @@
 # Omni 受管媒体存储设计
 
+> **Transport revision (2026-08-12):** 本文的 content-addressed objects、
+> staging、quarantine 与恢复约束继续有效；DashScope upload cache 只是一个
+> adapter-owned remote-handle cache。多 Provider 的缓存隔离和引用生命周期由
+> [Provider-neutral Omni ingestion and multimodal delivery](./omni/2026-08-12-provider-neutral-multimodal-delivery.md)
+> 扩展。为保证识别、Memory、Policy 与实际投递绑定到同一不可变版本，新设计明确
+> 取代本文 §5“本地用户文件不复制入 objects”的规则：逻辑 File 仍保留独立
+> locator/provenance，但每个成功受管的 FileVersion 都由 content-addressed object
+> 在 live/rooted 生命周期内提供字节后端。FileVersion metadata 本身不会永久 pin
+> bytes；最后一个 conversation/session/in-flight root 释放并超过 retention 后，
+> object 可回收，storage catalog 标为 `missing`，metadata/lineage 仍可召回，用户
+> 显式重新引用源可恢复 backing。该规则取代本文 §6“全部 active Memory 记录永久
+> 作为对象根”的结论。v2 authority/object/sidecar 不再位于 workspace 的
+> `.qwen` 下，而是放在模型文件工具与 shell sandbox 不可见的 per-user brokered
+> application-data root。workspace 内除只读 v1 import 来源外，唯一可写例外是
+> bounded、signed、non-secret 的 `workspace-binding-v1.json` 注册 marker；它不是
+> Memory/object/sidecar，旧 binary 必须忽略且不得按 v1 Memory 解析。broker 的单一
+> catalog 负责 workspace binding generation、project tombstone/retention 与
+> per-user aggregate quota，project-local quota/GC 不能替代该上层边界。
+> workspace lifecycle 的 path lock 由冻结的 platform-native lexical slot
+> identity 选择，与可升级的逻辑 locator canonicalizer 和 parent inode 无关；
+> case/Unicode/short-name 依底层 volume 语义收敛，parent delete/recreate 不改变
+> slot。实际删除只允许 retained-handle、identity-checked 操作，不能把 mutable
+> string path 交给 recursive remove；无法证明时 managed registration 不可用。
+> Managed conversation 是创建时不可变的会话模式，不会原地升级 legacy
+> transcript。它的 transcript、archive、file-history、sidecar 与 writer fence 从
+> 第一字节起都只位于 broker/project application-data 私有根；旧 binary 不知道也
+> 无法枚举该根，同 ID 的 runtime legacy 文件不会被导入、合并或作为 fallback。
+> 所有 transcript reader/scanner 使用同一 broker route resolver。Managed fence 的
+> idle/live/delete-terminal 状态与 broker route 通过显式双域 saga 收敛；稳定的
+> route-authority digest 不包含 transition、物理 record digest 或 AEAD 随机编码，
+> 每次 claim/primary/temp 名字创建、替换、删除都 fsync 文件与 parent。global
+> monotonic conversation generation 在 lifecycle row compact 后仍防止旧 writer
+> 复活，cwd/worktree/runtime-base 不能被用来猜删除或恢复目标。
+> Conversation root 在 mkdir 前先有 broker bootstrap intent，正常删除只有在
+> fence、claim、root 各自 unlink/rmdir + parent fsync 后才 compact route。Managed
+> transcript/fork/file-history 内容计入 project `maxTotalBytes` 与 broker physical
+> pool，每次 append/batch 在首字节前持久 reservation，partial write 只能按旧长度
+> truncate 或 exact record UUID settle。Session ID 不是 capability：direct route
+> lookup 需要匹配 project binding lease，retirement/recovery 使用独立 maintenance
+> authority；cursor 绑定 project/binding/conversation generation、archive state 与
+> transcript file identity，不能使用 cwd 派生的 legacy key。
+> 注册 project 的 conversation root 没有 session TTL，只由会话/分支
+> tombstone 释放；unregistered project 超过明确保留期后，broker retirement 是更高
+> 优先级的管理 tombstone，必须先把全部持久引用标为 unavailable 并移除 root，才能
+> 删除 project bytes；任何非终态 session route 都会阻止 project purge，并先走
+> conversation-delete saga。
+> Mandatory managed target 不允许落在 workspace/worktree/runtime tree，且该规则对
+> retained terminal route 同样校验；因此 worktree 删除不会承担 session-target
+> containment 推断。`organizationRoot` 仅是 best-effort hint，不能授权或阻止字节
+> 删除。
+>
+> **Audit status (2026-08-14):** 审计已按请求停止。最后完成的三方审计是
+> Round 26，结果不 clean；Revision 27 已记录拟议修订，但 Round 27 未形成有效的
+> 三方结论。详见新设计的 [§12 Audit record](./omni/2026-08-12-provider-neutral-multimodal-delivery.md#12-audit-record)。
+
 ## 状态
 
 - 状态：Draft

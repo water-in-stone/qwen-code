@@ -1,5 +1,40 @@
 # Omni 多模态数据处理 Policy 编排架构设计
 
+> **Transport revision (2026-08-12):** 本文的 DashScope-only、统一 `oss://`
+> 与禁止 inline 投递结论，只描述首个实现。多 Provider 的投递选择、adapter-specific
+> transport guard 和 final validator 由
+> [Provider-neutral Omni ingestion and multimodal delivery](./omni/2026-08-12-provider-neutral-multimodal-delivery.md)
+> 扩展；本文的 Policy、disclosure、lineage 和受管产物约束继续有效。多产物、纯
+> transcript 与 omission 会作为有序 delivery group 延迟物化，且依赖 `session.*`
+> 的 Policy 必须使用实际消费该媒体的 provider request 上下文。模型/client Policy
+> 的 source identity 与 output authority 由 scheduler-private execution context
+> 传递，不再通过 `inputPath`/`outputDir` 反推；runtime-verdict recall 只允许
+> session-only ephemeral Policy，持久结果要求显式 re-reference。每个
+> policy-derived 持久 delivery item 单独引用 assertion-specific Policy use 和
+> use-local output ID，再由 use ref 解析到不可变 execution-output ID；use 记录使用
+> 区分 media、text/file、omission/disclosure 的有序 output ref，多
+> Policy/guard 输出不能用一个 group-level use 或仅 entry-ID 列表覆盖。
+> PolicyUse 是随 conversation/branch group 持久化和 tombstone 的 occurrence，
+> 不是永久 computation fact；sidecar、Memory authority 与 append-only chat 之间
+> 通过显式 adopting saga、幂等 owner key 和 chat record evidence 收敛。
+> PolicyUse 的 pending/completed 形态是严格判别联合；持久 chat 已提交但 sidecar
+> 缺失/损坏时记录 bounded unavailable correction，而会话文件删除由 chat 外部的
+> durable delete intent 驱动，不能先删除唯一 tombstone evidence。
+> Sidecar、raw/derived object root 与一个 group 内的全部 PolicyUse 通过同一个
+> group-level adoption saga 原子进入 adopting/durable/unavailable 状态；单个
+> PolicyUse owner 不能代表 raw-only 或 mixed group 的持久化边界。
+> Fork/branch 对既有 use 只增加目标 owner，不替换来源 owner；删除将 durable
+> group 原子转为不再 pin bytes、但保留 sidecar cleanup authority 的 deleting
+> row，直到 unlink 与 parent fsync 完成。Fork 目标在 transcript、全部 group 和
+> file-history 完成前保持 broker `fork-preparing`；transcript 先写入确定性的私有
+> temp leaf 并 fsync file/parent，再 no-replace rename 到 final leaf、再次 fsync
+> parent，proof 才从 planned 经 temp-published 进入 published，不会把 partial file
+> 作为 active 会话暴露。
+>
+> **Audit status (2026-08-14):** 审计已按请求停止。最后完成的三方审计是
+> Round 26，结果不 clean；Revision 27 已记录拟议修订，但 Round 27 未形成有效的
+> 三方结论。详见新设计的 [§12 Audit record](./omni/2026-08-12-provider-neutral-multimodal-delivery.md#12-audit-record)。
+
 ## 状态
 
 - 状态：Draft

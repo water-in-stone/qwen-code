@@ -1,5 +1,18 @@
 # 多模态文件识别与元数据提取架构设计
 
+> **Transport revision (2026-08-12):** 识别、本地化、内容身份和 metadata
+> 继续以本文为准；“投递层统一采用 DashScope”的范围已由
+> [Provider-neutral Omni ingestion and multimodal delivery](./omni/2026-08-12-provider-neutral-multimodal-delivery.md)
+> 扩展为 provider-neutral managed resource 加显式 delivery adapter。同一
+> FileVersion 的识别结果不再是单一可变字段，而是按 detector、ingestion config
+> 与 probe identity 区分的不可变 assertion；PATH-based probe 每次运行使用独立
+> identity。持久 delivery group 记录历史 assertion 作为 provenance，但每次新的
+> 物理投递必须对固定 bytes 生成当前 assertion，并仅用当前结果执行 guard。
+>
+> **Audit status (2026-08-14):** 审计已按请求停止。最后完成的三方审计是
+> Round 26，结果不 clean；Revision 27 已记录拟议修订，但 Round 27 未形成有效的
+> 三方结论。详见新设计的 [§12 Audit record](./omni/2026-08-12-provider-neutral-multimodal-delivery.md#12-audit-record)。
+
 ## 状态
 
 - 状态：Draft

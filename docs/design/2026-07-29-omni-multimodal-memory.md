@@ -1,5 +1,30 @@
 # Omni 多模态 Memory 架构设计
 
+> **Storage-lifecycle revision (2026-08-12):** 本文的三层 File 身份、两个
+> collection trigger 与 read-only recall 约束继续有效；Provider-neutral v2 的
+> bytes liveness 由
+> [Provider-neutral Omni ingestion and multimodal delivery](./omni/2026-08-12-provider-neutral-multimodal-delivery.md)
+> 扩展。conversation sidecar、active session/in-flight lease 与独立 best-effort
+> access journal 取代本文“任意 active Memory 记录永久 pin artifact bytes”的规则。
+> 无 root 且超过 retention 的 backing 可回收并标为 `missing`，但 metadata、lineage
+> 与两个语义写入触发点保持不变；recall 不因 access journal 写入失败而改变结果。
+> FileVersion 仍表示字节身份；同一字节在 detector/config/probe 升级后的识别结果
+> 由版本化 recognition assertion 表示，并仍在 FileRecognized 事务内提交，不增加
+> 第三个 collection trigger。File 的 current pointer 是
+> `(FileVersion, recognitionAssertion)` 原子对；历史 assertion 仅作 provenance，
+> runtime verdict 不会由 recall 写入 Memory。
+> Conversation byte roots 归属于 group-level adoption record，而不是可独立于
+> sidecar/chat 提交的 per-object row；adopting 与 durable group 都是 GC roots，
+> group correction/tombstone 才能整体释放。
+> Group 删除先转为不含 root 的 authenticated deleting row，以保留 sidecar
+> locator/digest/file identity；fork owner 是 add-if-absent，不能移走 source
+> conversation 的 owner/root。Sidecar 的 HMAC ID 与认证 envelope 绑定
+> conversation generation；旧 generation 的合法 sidecar 不能被新会话采用。
+>
+> **Audit status (2026-08-14):** 审计已按请求停止。最后完成的三方审计是
+> Round 26，结果不 clean；Revision 27 已记录拟议修订，但 Round 27 未形成有效的
+> 三方结论。详见新设计的 [§12 Audit record](./omni/2026-08-12-provider-neutral-multimodal-delivery.md#12-audit-record)。
+
 ## 状态
 
 - 状态：Draft
