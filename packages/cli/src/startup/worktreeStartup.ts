@@ -23,19 +23,22 @@
 
 import * as path from 'node:path';
 import {
-  createDebugLogger,
   createWorktreeSessionMarker,
   ensureWorktreeSessionMarkerExcluded,
   GitWorktreeService,
-  getSessionRuntimeLiveness,
-  readWorktreeSession,
   readWorktreeSessionMarker,
+  replaceWorktreeSessionMarker,
   worktreeBranchForSlug,
   WorktreeSessionMarkerOwnerChangedError,
-  replaceWorktreeSessionMarker,
+} from '@qwen-code/qwen-code-core/services/gitWorktreeService.js';
+import {
+  getSessionRuntimeLiveness,
+  readWorktreeSession,
   writeWorktreeSession,
-} from '@qwen-code/qwen-code-core';
-import type { Config, WorktreeSession } from '@qwen-code/qwen-code-core';
+} from '@qwen-code/qwen-code-core/services/worktreeSessionService.js';
+import { createDebugLogger } from '@qwen-code/qwen-code-core/utils/debugLogger.js';
+import type { Config } from '@qwen-code/qwen-code-core/config/config.js';
+import type { WorktreeSession } from '@qwen-code/qwen-code-core/services/worktreeSessionService.js';
 
 const debugLogger = createDebugLogger('WORKTREE_STARTUP');
 
