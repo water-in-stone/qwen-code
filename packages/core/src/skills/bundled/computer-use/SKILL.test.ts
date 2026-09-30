@@ -24,9 +24,9 @@ function loadComputerUseSkill() {
 }
 
 describe('bundled computer-use skill', () => {
-  it.each([true, false])(
-    'runs the forwarding example with desktop relay available=%s',
-    async (desktopAvailable) => {
+  it.each(['desktop', 'managed', 'regular'] as const)(
+    'runs the forwarding example with %s Node REPL selected',
+    async (selected) => {
       const { body } = loadComputerUseSkill();
       const example = body.match(/```js\n([\s\S]*?)\n```/)?.[1];
       expect(example).toBeDefined();
@@ -39,6 +39,7 @@ describe('bundled computer-use skill', () => {
         content: [{ type: 'text', text: 'macos' }, screenshot],
       };
       const desktop = vi.fn().mockResolvedValue(result);
+      const managed = vi.fn().mockResolvedValue(result);
       const regular = vi.fn().mockResolvedValue(result);
       const text = vi.fn();
       const image = vi.fn();
@@ -46,8 +47,11 @@ describe('bundled computer-use skill', () => {
       // unknown key, so an unbound desktop tool must be probed with `in`.
       const toolTarget = Object.assign(Object.create(null), {
         mcp__node_repl__node_repl: regular,
-        ...(desktopAvailable
+        ...(selected === 'desktop'
           ? { mcp__desktop_node_repl__node_repl: desktop }
+          : {}),
+        ...(selected !== 'regular'
+          ? { mcp__computer_use_node_repl__node_repl: managed }
           : {}),
       }) as Record<string, unknown>;
       const tools = new Proxy(toolTarget, {
@@ -62,17 +66,22 @@ describe('bundled computer-use skill', () => {
       });
       await runInNewContext(`(async () => {${example}})()`, {
         tools,
-        ALL_TOOLS: desktopAvailable
-          ? [{ name: 'mcp__desktop_node_repl__node_repl' }]
-          : [],
         code: 'return platform',
         text,
         image,
       });
-      expect(desktopAvailable ? desktop : regular).toHaveBeenCalledWith({
+      const expected =
+        selected === 'desktop'
+          ? desktop
+          : selected === 'managed'
+            ? managed
+            : regular;
+      expect(expected).toHaveBeenCalledWith({
         code: 'return platform',
       });
-      expect(desktopAvailable ? regular : desktop).not.toHaveBeenCalled();
+      for (const candidate of [desktop, managed, regular]) {
+        if (candidate !== expected) expect(candidate).not.toHaveBeenCalled();
+      }
       expect(text).toHaveBeenCalledWith('macos');
       expect(image).toHaveBeenCalledWith(screenshot);
     },
@@ -82,9 +91,10 @@ describe('bundled computer-use skill', () => {
     const { config, body } = loadComputerUseSkill();
     expect(config.name).toBe('computer-use');
     expect(config.allowedTools).toBeUndefined();
-    expect(body).toContain('`desktop-node-repl` MCP server');
+    expect(body).toContain('`desktop-node-repl`');
     expect(body).toContain('mcp__desktop_node_repl__node_repl');
-    expect(body).toContain('skip the installation commands below');
+    expect(body).toContain('mcp__computer_use_node_repl__node_repl');
+    expect(body).toContain('computer_use_setup');
     expect(body).toContain('ComputerUse.create()');
     expect(body).toContain('await computer.getPlatform()');
     expect(body).toContain('computer.getApp(');
@@ -93,6 +103,16 @@ describe('bundled computer-use skill', () => {
     expect(body).not.toMatch(
       /references\/|computer\.observeWindow\(|computer\.listWindows\(|elementToken|windowId/,
     );
+  });
+
+  it('uses restartless product setup instead of workspace installation', () => {
+    const { body } = loadComputerUseSkill();
+    expect(body).toContain('without changing the');
+    expect(body).toContain('restarting Qwen Code');
+    expect(body).toContain('Do not install packages into the workspace');
+    expect(body).not.toContain('qwen mcp add');
+    expect(body).not.toContain('npm install');
+    expect(body).not.toContain('Tell the user to restart');
   });
 
   it('preserves batching, incremental observation and safe refresh guidance', () => {

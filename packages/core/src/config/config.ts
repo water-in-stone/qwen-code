@@ -12373,6 +12373,19 @@ export class Config {
         return new SkillTool(this);
       });
     }
+    if (
+      !options?.forSubAgent &&
+      !this.sdkMode &&
+      !this.isSafeMode() &&
+      resolveInteractionMode(this) === 'interactive'
+    ) {
+      await registerLazy(ToolNames.COMPUTER_USE_SETUP, async () => {
+        const { ComputerUseSetupTool } = await import(
+          '../tools/computer-use-setup.js'
+        );
+        return new ComputerUseSetupTool(this);
+      });
+    }
     // list_directory is opt-in (disabled by default): glob covers directory
     // listing in most cases, so the tool only registers when explicitly
     // enabled via `tools.listDirectory.enabled` or the coreTools allowlist.

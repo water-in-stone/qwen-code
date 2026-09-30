@@ -3637,6 +3637,7 @@ describe('PermissionManager', () => {
         ['plan-mode ask_user_question', 'ask_user_question'],
         ['task_stop', 'task_stop'],
         ['tool_search', 'tool_search'],
+        ['computer_use_setup', ToolNames.COMPUTER_USE_SETUP],
         // The bridge's other half, exempt since the bridge landed (#10410) and
         // untested until now: deleting that arm of isExemptFromEagerAllowList
         // left this whole suite green. Both halves are also alwaysLoad=true, so

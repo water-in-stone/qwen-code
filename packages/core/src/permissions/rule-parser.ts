@@ -145,6 +145,11 @@ export const TOOL_NAME_ALIASES: Readonly<Record<string, string>> = {
   Skill: 'skill',
   SkillTool: 'skill',
 
+  // Computer Use runtime setup tool
+  computer_use_setup: 'computer_use_setup',
+  ComputerUseSetup: 'computer_use_setup',
+  ComputerUseSetupTool: 'computer_use_setup',
+
   // ExitPlanMode tool
   exit_plan_mode: 'exit_plan_mode',
   ExitPlanMode: 'exit_plan_mode',

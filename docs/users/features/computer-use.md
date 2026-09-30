@@ -1,17 +1,19 @@
 # Computer Use
 
-Qwen Code includes a `computer-use` skill that teaches the model how to
-operate desktop applications through two separately installed packages:
+Qwen Code includes a `computer-use` skill and a built-in restartless setup tool
+that prepare the desktop runtime on first use:
 
 ```text
 bundled computer-use skill
-  -> @qwen-code/node-repl-mcp
-  -> @qwen-code/cua-sdk/computer-use
+  -> computer_use_setup
+  -> Qwen-managed @qwen-code/node-repl-mcp
+  -> pinned @qwen-code/cua-sdk/computer-use
   -> native cua-driver accessibility backend
 ```
 
-Qwen Code does not bundle the MCP server, SDK, or native driver. The skill
-installs the external packages automatically when they are missing.
+The MCP server and SDK are installed on demand into a versioned Qwen-managed
+directory. They are connected to the current session through runtime-only MCP
+registration.
 
 > [!warning]
 >
@@ -22,22 +24,28 @@ installs the external packages automatically when they are missing.
 
 Node.js 22 or later and npm are required.
 
-When first used, the skill runs these commands itself:
+When no desktop relay or existing Node REPL is available, the skill calls
+`computer_use_setup`. The tool installs these pinned packages:
 
-```bash
-qwen mcp add --scope user node-repl npx -y @qwen-code/node-repl-mcp@0.1.7
-npm install --no-save --package-lock=false @qwen-code/cua-sdk@0.20.11
+```text
+@qwen-code/node-repl-mcp@0.1.6
+@qwen-code/cua-sdk@0.20.11
 ```
 
-Restart Qwen Code after the MCP server is first added. The skill then resumes
-the desktop task through `node_repl`.
+The runtime is stored under:
 
-The SDK installation leaves `package.json` and the lockfile unchanged, but it
-does write to the workspace's `node_modules`. Its postinstall downloads and
-verifies the native payload for the current platform.
+```text
+~/.qwen/computer-use/runtimes/
+```
 
-Removing the MCP configuration or workspace SDK installation disables the
-execution path; there is no legacy fallback.
+Setup does not modify the workspace, its `node_modules`, or user MCP settings.
+The installed Node REPL is connected to the active session immediately, so the
+same conversation continues without restarting Qwen Code. A later session
+reuses the verified runtime and reconnects it without reinstalling.
+
+The SDK postinstall downloads and verifies the native payload for the current
+platform. First use therefore requires network access unless npm and native
+artifacts are already cached.
 
 ## Use
 
@@ -76,15 +84,19 @@ return keeps it hidden; request it explicitly with
 
 ## Permissions
 
-The Node REPL is an MCP server that executes model-authored JavaScript with
-ordinary Node.js authority. Its calls follow Qwen Code's normal
-[MCP approval flow](./approval-mode.md). The SDK also enforces native
-authorization.
+`computer_use_setup` asks for approval before it writes product files, runs npm
+lifecycle scripts, and starts the managed MCP process. The Node REPL executes
+model-authored JavaScript with ordinary Node.js authority, and its calls
+continue to follow Qwen Code's normal [MCP approval flow](./approval-mode.md).
+There is no additional nested per-action approval layer. The SDK also enforces
+native authorization.
 
 On macOS, accessibility observation and input require Accessibility permission.
 Screenshots additionally require Screen Recording permission. macOS may
 attribute the grant to the terminal or IDE that launched Qwen Code. Windows and
-Linux use their platform accessibility and input facilities.
+Linux use their platform accessibility and input facilities. Restartless setup
+does not change this launcher-owned identity into a signed Qwen application
+identity.
 
 ## Use the computer in front of you from a remote session
 
@@ -114,10 +126,14 @@ asks to allow `node` under Accessibility and Screen Recording the first time.
 
 ## Troubleshooting
 
-- If `node_repl` is still unavailable after automatic setup, restart Qwen Code
-  and verify the server with `qwen mcp list`.
-- If the SDK import still fails after automatic setup, confirm Qwen Code is
-  running from the workspace where the package was installed.
+- If setup fails, read the `computer_use_setup` error. npm/network failures,
+  native postinstall failures, and an invalid published runtime all fail
+  without changing MCP settings.
+- If setup reports an invalid existing runtime, remove only the versioned
+  runtime directory named in the error, then retry. Setup never replaces that
+  directory while another process may still be using it.
+- If a user-managed Node REPL cannot import the SDK, run
+  `computer_use_setup` and use `computer-use-node-repl` instead.
 - After a timeout, cancellation, reset, or kernel crash, bootstrap the SDK
   client again and request fresh state.
 

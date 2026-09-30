@@ -5,7 +5,46 @@ Rust-backed TypeScript/Node SDK for Cua Driver client applications.
 The package root exposes the complete typed driver SDK. The
 `@qwen-code/cua-sdk/computer-use` subpath exposes the smaller high-level API for
 application discovery, revision observations, element-token actions, and state
-verification. Both entrypoints ship in this one npm package.
+verification. The `@qwen-code/cua-sdk/browser-use` subpath exposes exact browser
+binding, semantic page observations, and fixed page actions. All entrypoints
+ship in this one npm package.
+
+This Browser Use subpath is an application SDK. Qwen Code's canonical bundled
+`browser-use` Skill uses the separate Chrome-extension Browser Use runtime and
+does not import this facade.
+
+## Browser Use
+
+Use the Browser facade for supported Chromium-family page content:
+
+```ts
+import { BrowserUse } from "@qwen-code/cua-sdk/browser-use"
+
+const browser = await BrowserUse.create()
+try {
+  const windows = await browser.listWindows({ pid })
+  const binding = await browser.bindWindow({
+    pid,
+    windowId: windows[0].window_id,
+  })
+  const tabInfo =
+    binding.tabs.find((tab) => tab.active === true) ??
+    (binding.tabs.length === 1 ? binding.tabs[0] : undefined)
+  if (!tabInfo) throw new Error("select an explicit tab")
+  const tab = binding.getTab(tabInfo.tabId)
+  const state = await tab.observe()
+  const clickRef = state.refs.find((ref) => ref.actions.includes("click"))
+  if (!clickRef) throw new Error("no clickable ref")
+  await tab.click({ ref: clickRef.ref, inputRoute: "dom_event" })
+} finally {
+  await browser.close()
+}
+```
+
+The facade does not expose generic Driver dispatch, existing-profile
+attachment, file transfer, download, or JavaScript dialog mutation. See
+[`browser-use/README.md`](browser-use/README.md) for the supported workflow and
+authorization boundary.
 
 ## Product boundary
 

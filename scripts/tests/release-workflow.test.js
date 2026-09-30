@@ -70,6 +70,10 @@ const computerUseGuide = readFileSync(
   'docs/users/features/computer-use.md',
   'utf8',
 );
+const computerUseSetup = readFileSync(
+  'packages/core/src/tools/computer-use-setup.ts',
+  'utf8',
+);
 const desktopReleaseWorkflow = readFileSync(
   '.github/workflows/desktop-release.yml',
   'utf8',
@@ -145,19 +149,33 @@ describe('CUA release workflow', () => {
     );
   });
 
-  it('pins exact Computer Use package versions across the skill and user guide', () => {
+  it('pins exact Computer Use package versions across setup and user guide', () => {
+    const setupNodeReplVersion = computerUseSetup.match(
+      /COMPUTER_USE_NODE_REPL_VERSION = '([^']+)'/,
+    )?.[1];
+    const setupCuaSdkVersion = computerUseSetup.match(
+      /COMPUTER_USE_CUA_SDK_VERSION = '([^']+)'/,
+    )?.[1];
+    expect(setupNodeReplVersion).toBeDefined();
+    expect(setupCuaSdkVersion).toBe(cuaSdkPackage.version);
     expect(computerUseGuide).toContain(
-      `@qwen-code/node-repl-mcp@${nodeReplPackage.version}`,
+      `@qwen-code/node-repl-mcp@${setupNodeReplVersion}`,
     );
     expect(computerUseGuide).toContain(
       `@qwen-code/cua-sdk@${cuaSdkPackage.version}`,
     );
-    expect(cuaReleaseWorkflow).toContain('SKILL_NODE_REPL_VERSION=$(sed -nE');
     expect(cuaReleaseWorkflow).toContain(
-      'USER_GUIDE_NODE_REPL_VERSION=$(sed -nE',
+      'COMPUTER_USE_SETUP_NODE_REPL_VERSION=$(sed -nE',
     );
-    expect(cuaReleaseWorkflow).toContain('SKILL_SDK_VERSION=$(sed -nE');
-    expect(cuaReleaseWorkflow).toContain('USER_GUIDE_SDK_VERSION=$(sed -nE');
+    expect(cuaReleaseWorkflow).toContain(
+      'COMPUTER_USE_SETUP_SDK_VERSION=$(sed -nE',
+    );
+    expect(cuaReleaseWorkflow).toContain(
+      'Computer Use setup Node REPL version $COMPUTER_USE_SETUP_NODE_REPL_VERSION is not published',
+    );
+    expect(cuaReleaseWorkflow).toContain(
+      'COMPUTER_USE_SETUP_NODE_REPL_VERSION" != "$NODE_REPL_VERSION',
+    );
     expect(cuaReleaseWorkflow).not.toContain(
       'grep -Fq "@qwen-code/node-repl-mcp@',
     );
