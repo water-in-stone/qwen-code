@@ -80,6 +80,7 @@ export const AGENT_TOOL_CLASSIFICATION = {
   [ToolNames.ARTIFACT]: 'deny',
   [ToolNames.RECORD_ARTIFACT]: 'deny',
   [ToolNames.RECORD_SOURCE]: 'deny',
+  [ToolNames.COMPUTER_USE_SETUP]: 'deny',
   [ToolNames.REPORT_FINDINGS]: 'deny',
   [ToolNames.GET_GOAL]: 'allow',
   [ToolNames.UPDATE_GOAL]: 'deny',

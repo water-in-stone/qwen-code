@@ -889,6 +889,7 @@ export class PermissionManager {
       canonicalName === ToolNames.TASK_STOP ||
       canonicalName === ToolNames.TOOL_CALL ||
       canonicalName === ToolNames.TOOL_SEARCH ||
+      canonicalName === ToolNames.COMPUTER_USE_SETUP ||
       canonicalName.startsWith('mcp__') ||
       canonicalName.startsWith('computer_use__')
     );
@@ -931,6 +932,8 @@ export class PermissionManager {
    *   schemas never enter the eager model request, so gating it buys
    *   nothing for the schema-shrink goal and only strips the sanctioned
    *   stop flow while the tool that advertises it stays listed (#9827).
+   * - `computer_use_setup`: the bundled Computer Use Skill needs this stable
+   *   first-use bootstrap before any runtime MCP tools exist.
    * - Computer Use tools (`computer_use__*`): the generated cua-driver
    *   surface (35 tools, `computerUseEnabled` defaults to true) has no
    *   alias entry, meta-category, or wildcard rule form — the wire names

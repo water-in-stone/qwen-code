@@ -2612,6 +2612,7 @@ describe('PermissionManager', () => {
         ['plan-mode ask_user_question', 'ask_user_question'],
         ['task_stop', 'task_stop'],
         ['tool_search', 'tool_search'],
+        ['computer_use_setup', ToolNames.COMPUTER_USE_SETUP],
         // The bridge's other half, exempt since #10410 yet untested: deleting
         // that isExemptFromEagerAllowList arm left the suite green. Both halves
         // are alwaysLoad=true, so the arm guards not the declaration list but

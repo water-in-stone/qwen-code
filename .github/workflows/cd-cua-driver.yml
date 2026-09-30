@@ -109,8 +109,8 @@ jobs:
           # shellcheck disable=SC2016
           README_PS1_VERSION=$(sed -nE 's/^\$env:CUA_DRIVER_RS_VERSION = "([^"]+)"$/\1/p' packages/cua-driver/README.md)
           README_EXPECTED_VERSION=$(sed -nE 's/^Expected: qwen-cua-driver ([0-9A-Za-z.-]+)\.$/\1/p' packages/cua-driver/README.md)
-          SKILL_SDK_VERSION=$(sed -nE 's/^npm install --no-save --package-lock=false @qwen-code\/cua-sdk@([^ ]+)$/\1/p' packages/core/src/skills/bundled/computer-use/SKILL.md | sort -u)
-          USER_GUIDE_SDK_VERSION=$(sed -nE 's/^npm install --no-save --package-lock=false @qwen-code\/cua-sdk@([^ ]+)$/\1/p' docs/users/features/computer-use.md)
+          COMPUTER_USE_SETUP_SDK_VERSION=$(sed -nE "s/^export const COMPUTER_USE_CUA_SDK_VERSION = '([^']+)';$/\1/p" packages/core/src/tools/computer-use-setup.ts)
+          USER_GUIDE_SDK_VERSION=$(sed -nE 's/^@qwen-code\/cua-sdk@([^ ]+)$/\1/p' docs/users/features/computer-use.md)
           for PAIR in \
             "shell installer:$INSTALL_SH_VERSION" \
             "PowerShell installer:$INSTALL_PS1_VERSION" \
@@ -120,7 +120,7 @@ jobs:
             "README shell command:$README_SH_VERSION" \
             "README PowerShell command:$README_PS1_VERSION" \
             "README expected output:$README_EXPECTED_VERSION" \
-            "Computer Use skill SDK:$SKILL_SDK_VERSION" \
+            "Computer Use setup SDK:$COMPUTER_USE_SETUP_SDK_VERSION" \
             "Computer Use user guide SDK:$USER_GUIDE_SDK_VERSION"; do
             LABEL=${PAIR%%:*}
             VALUE=${PAIR#*:}
@@ -140,20 +140,29 @@ jobs:
             echo "::error::Invalid Node REPL package version $NODE_REPL_VERSION"
             exit 1
           fi
-          SKILL_NODE_REPL_VERSION=$(sed -nE 's/^qwen mcp add --scope user node-repl npx -y @qwen-code\/node-repl-mcp@([^ ]+)$/\1/p' packages/core/src/skills/bundled/computer-use/SKILL.md)
-          USER_GUIDE_NODE_REPL_VERSION=$(sed -nE 's/^qwen mcp add --scope user node-repl npx -y @qwen-code\/node-repl-mcp@([^ ]+)$/\1/p' docs/users/features/computer-use.md)
+          COMPUTER_USE_SETUP_NODE_REPL_VERSION=$(sed -nE "s/^export const COMPUTER_USE_NODE_REPL_VERSION = '([^']+)';$/\1/p" packages/core/src/tools/computer-use-setup.ts)
+          USER_GUIDE_NODE_REPL_VERSION=$(sed -nE 's/^@qwen-code\/node-repl-mcp@([^ ]+)$/\1/p' docs/users/features/computer-use.md)
           BROWSER_USE_SKILL_NODE_REPL_VERSION=$(sed -nE 's/^qwen mcp add --scope user node-repl npx -y @qwen-code\/node-repl-mcp@([^ ]+)$/\1/p' packages/core/src/skills/bundled/browser-use/SKILL.md)
+          if [[ ! "$COMPUTER_USE_SETUP_NODE_REPL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid Computer Use setup Node REPL version $COMPUTER_USE_SETUP_NODE_REPL_VERSION"
+            exit 1
+          fi
           for PAIR in \
-            "Computer Use skill Node REPL:$SKILL_NODE_REPL_VERSION" \
-            "Computer Use user guide Node REPL:$USER_GUIDE_NODE_REPL_VERSION" \
-            "Browser Use skill Node REPL:$BROWSER_USE_SKILL_NODE_REPL_VERSION"; do
+            "Computer Use user guide Node REPL:$USER_GUIDE_NODE_REPL_VERSION:$COMPUTER_USE_SETUP_NODE_REPL_VERSION" \
+            "Browser Use skill Node REPL:$BROWSER_USE_SKILL_NODE_REPL_VERSION:$NODE_REPL_VERSION"; do
             LABEL=${PAIR%%:*}
-            VALUE=${PAIR#*:}
-            if [[ "$VALUE" != "$NODE_REPL_VERSION" ]]; then
-              echo "::error::$LABEL version $VALUE does not match Node REPL version $NODE_REPL_VERSION"
+            REST=${PAIR#*:}
+            VALUE=${REST%%:*}
+            EXPECTED=${REST#*:}
+            if [[ "$VALUE" != "$EXPECTED" ]]; then
+              echo "::error::$LABEL version $VALUE does not match expected version $EXPECTED"
               exit 1
             fi
           done
+          if [[ "$COMPUTER_USE_SETUP_NODE_REPL_VERSION" != "$NODE_REPL_VERSION" ]] && ! npm view "@qwen-code/node-repl-mcp@${COMPUTER_USE_SETUP_NODE_REPL_VERSION}" dist.integrity >/dev/null 2>&1; then
+            echo "::error::Computer Use setup Node REPL version $COMPUTER_USE_SETUP_NODE_REPL_VERSION is not published"
+            exit 1
+          fi
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" != "true" && "$GITHUB_REF" != "refs/heads/main" ]]; then
             echo "::error::A production dispatch must run from protected main"
