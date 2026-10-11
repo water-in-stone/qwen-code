@@ -4056,6 +4056,7 @@ it.each<{
   failResult?: boolean;
   bothEvents?: boolean;
   unstartedSibling?: boolean;
+  cancelledSizePlan?: 'not_started_proven' | 'settled';
   bounded?: boolean;
 }>([
   { event: HookEventName.PermissionRequest, deny: false },
@@ -4065,6 +4066,12 @@ it.each<{
     unstartedSibling: true,
   },
   { event: HookEventName.PreToolUse, deny: false, bounded: true },
+  { event: HookEventName.PermissionRequest, deny: false, bounded: true },
+  ...(['not_started_proven', 'settled'] as const).map((cancelledSizePlan) => ({
+    event: HookEventName.PermissionRequest,
+    deny: false,
+    cancelledSizePlan,
+  })),
   { event: HookEventName.PreToolUse, deny: false },
   { event: HookEventName.PreToolUse, deny: true },
   {
@@ -4080,7 +4087,7 @@ it.each<{
   { event: HookEventName.PreToolUse, deny: false, failResult: true },
   { event: HookEventName.PreToolUse, deny: false, bothEvents: true },
 ])(
-  'refuses a durable malformed $event rewrite for the entire batch (deny: $deny, sibling: $denySibling, fault: $failResult, concurrent marker reads: $bothEvents, unstarted sibling: $unstartedSibling, bounded: $bounded) across reconstruction',
+  'refuses a durable malformed $event rewrite for the entire batch (deny: $deny, sibling: $denySibling, fault: $failResult, concurrent marker reads: $bothEvents, unstarted sibling: $unstartedSibling, cancelled size plan: $cancelledSizePlan, bounded: $bounded) across reconstruction',
   async ({
     event,
     deny,
@@ -4088,6 +4095,7 @@ it.each<{
     failResult,
     bothEvents,
     unstartedSibling,
+    cancelledSizePlan,
     bounded,
   }) => {
     const pin = {
@@ -4111,19 +4119,24 @@ it.each<{
                     ...(bothEvents ? [HookEventName.PermissionRequest] : []),
                     HookEventName.PostToolBatch,
                   ]),
-                ].map((eventName) => ({
-                  hookId: eventName,
-                  eventName,
-                  matcher:
-                    bothEvents || unstartedSibling
-                      ? undefined
-                      : 'run_shell_command',
-                  sequential: bounded ?? false,
-                  async: false,
-                  failClosed: true,
-                  onceKey: null,
-                  config: { type: 'command' as const },
-                })),
+                ].flatMap((eventName) => {
+                  const hook = {
+                    hookId: eventName,
+                    eventName,
+                    matcher:
+                      bothEvents || unstartedSibling || cancelledSizePlan
+                        ? undefined
+                        : 'run_shell_command',
+                    sequential: bounded ?? false,
+                    async: false,
+                    failClosed: true,
+                    onceKey: null,
+                    config: { type: 'command' as const },
+                  };
+                  return bounded && event === HookEventName.PermissionRequest
+                    ? [{ ...hook, hookId: `${eventName}:metadata` }, hook]
+                    : [hook];
+                }),
               },
             }
           : {
@@ -4131,50 +4144,71 @@ it.each<{
                 success: true,
                 outcome: 'success',
                 duration: 0,
-                output: bounded
-                  ? {
-                      hookSpecificOutput: {
-                        tool_input: { description: '\ud800' },
-                        padding: 'x'.repeat(40 * 1024),
-                      },
-                    }
-                  : {
-                      hookSpecificOutput:
-                        operation.kind === 'hook-execute' &&
-                        operation.hookId === HookEventName.PermissionRequest
-                          ? {
-                              decision: {
-                                behavior:
-                                  denySibling &&
+                output:
+                  bounded && event === HookEventName.PermissionRequest
+                    ? {
+                        hookSpecificOutput:
+                          operation.kind === 'hook-execute' &&
+                          operation.hookId.endsWith(':metadata')
+                            ? {
+                                decision: {
+                                  behavior: 'allow',
+                                  message: 'x'.repeat(40 * 1024),
+                                },
+                              }
+                            : {
+                                updatedInput: {
+                                  command: 'x'.repeat(40 * 1024),
+                                  description: '\ud800',
+                                },
+                              },
+                      }
+                    : bounded
+                      ? {
+                          hookSpecificOutput: {
+                            tool_input: { description: '\ud800' },
+                            padding: 'x'.repeat(40 * 1024),
+                          },
+                        }
+                      : {
+                          hookSpecificOutput:
+                            operation.kind === 'hook-execute' &&
+                            operation.hookId === HookEventName.PermissionRequest
+                              ? {
+                                  decision: {
+                                    behavior:
+                                      denySibling &&
+                                      operation.kind === 'hook-execute' &&
+                                      'tool_use_id' in operation.input &&
+                                      operation.input.tool_use_id ===
+                                        'denied-sibling'
+                                        ? 'deny'
+                                        : 'allow',
+                                    ...(event ===
+                                    HookEventName.PermissionRequest
+                                      ? { updatedInput: malformed }
+                                      : {}),
+                                  },
+                                }
+                              : {
+                                  ...(denySibling &&
                                   operation.kind === 'hook-execute' &&
                                   'tool_use_id' in operation.input &&
                                   operation.input.tool_use_id ===
                                     'denied-sibling'
-                                    ? 'deny'
-                                    : 'allow',
-                                ...(event === HookEventName.PermissionRequest
-                                  ? { updatedInput: malformed }
-                                  : {}),
-                              },
-                            }
-                          : {
-                              ...(denySibling &&
-                              operation.kind === 'hook-execute' &&
-                              'tool_use_id' in operation.input &&
-                              operation.input.tool_use_id === 'denied-sibling'
-                                ? {
-                                    permissionDecision: 'deny',
-                                    permissionDecisionReason:
-                                      'recorded policy denial',
-                                  }
-                                : {
-                                    updatedInput: malformed,
-                                    ...(deny
-                                      ? { permissionDecision: 'deny' }
-                                      : {}),
-                                  }),
-                            },
-                    },
+                                    ? {
+                                        permissionDecision: 'deny',
+                                        permissionDecisionReason:
+                                          'recorded policy denial',
+                                      }
+                                    : {
+                                        updatedInput: malformed,
+                                        ...(deny
+                                          ? { permissionDecision: 'deny' }
+                                          : {}),
+                                      }),
+                                },
+                        },
               },
             }),
       }),
@@ -4213,8 +4247,16 @@ it.each<{
     };
     const batch = denySibling
       ? [{ ...shellCall, callId: 'denied-sibling' }, shellCall]
-      : [shellCall, calls[1]];
-    if (unstartedSibling) {
+      : [
+          shellCall,
+          cancelledSizePlan
+            ? {
+                ...calls[1],
+                args: { ...calls[1].args, new_string: 'x'.repeat(60 * 1024) },
+              }
+            : calls[1],
+        ];
+    if (unstartedSibling || cancelledSizePlan) {
       await hooks.ensureReady();
       const sibling = batch[1];
       const occurrenceId = hostedHookOccurrenceId(
@@ -4236,9 +4278,10 @@ it.each<{
           if (
             record.hookId === '__plan__' &&
             record.hookExecutionId === occurrenceId &&
-            record.run.execution === 'intent'
+            record.run.execution ===
+              (cancelledSizePlan === 'settled' ? 'dispatch_started' : 'intent')
           )
-            throw new Error('crash after plan before dispatch');
+            throw new Error('crash after plan commit');
           return result;
         });
       try {
@@ -4259,11 +4302,23 @@ it.each<{
         crash.mockRestore();
       }
       const marker = await hooks.status(occurrenceId, true);
-      expect(marker.resultRef).toBeNull();
+      if (cancelledSizePlan === 'settled')
+        expect(marker.resultRef).not.toBeNull();
+      else expect(marker.resultRef).toBeNull();
       expect(marker.run).toMatchObject({
         state: 'cancelled',
-        execution: 'not_started_proven',
+        execution: cancelledSizePlan ?? 'not_started_proven',
       });
+      if (cancelledSizePlan) {
+        const plan = JSON.parse(
+          (await session.resources.read(marker.planRef)).toString(),
+        );
+        expect(plan).toMatchObject({
+          refusedInputDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+          hooks: [],
+        });
+        expect(plan.input.tool_use_id).toBeUndefined();
+      }
     }
     const publish = bounded
       ? vi.spyOn(session.resources, 'publish')
@@ -4332,7 +4387,12 @@ it.each<{
         stopReason:
           'Hosted Shell description contains an unpaired UTF-16 surrogate. Provide valid Unicode and retry.',
       });
-      expect(saved.output.hookSpecificOutput).toBeUndefined();
+      if (event === HookEventName.PermissionRequest) {
+        expect(saved.output.hookSpecificOutput).toEqual({
+          decision: { behavior: 'deny', interrupt: true },
+        });
+        expect(broker.acquire).toHaveBeenCalledOnce();
+      } else expect(saved.output.hookSpecificOutput).toBeUndefined();
     }
     expect(broker.prepare).not.toHaveBeenCalled();
     expect(broker.execute).not.toHaveBeenCalled();
@@ -4363,7 +4423,9 @@ it.each<{
                 HookEventName.PermissionRequest,
                 event,
               ]
-            : [event],
+            : bounded && event === HookEventName.PermissionRequest
+              ? [`${event}:metadata`, event]
+              : [event],
     );
     const restored = createTurn(true, approval, makeHooks());
     const count = hookControl.mock.calls.length;
@@ -4481,6 +4543,176 @@ it.each<{
     await restored.close();
   },
 );
+
+it.each(['live arguments', 'persisted error text'] as const)(
+  'rejects contradictory Unicode refusal evidence: %s',
+  async (mismatch) => {
+    const hooks = hookSession(vi.fn());
+    const call = {
+      ...calls[0],
+      name: 'run_shell_command',
+      args: { command: '\ud800' },
+    };
+    turn = createTurn(true, undefined, hooks);
+    const assistant = [
+      {
+        functionCall: {
+          id: call.callId,
+          name: call.name,
+          args:
+            mismatch === 'live arguments'
+              ? { command: 'different\ud800' }
+              : call.args,
+        },
+      },
+    ];
+    if (mismatch === 'live arguments') {
+      await expect(
+        turn.execute([call], assistant, 'model', new AbortController().signal),
+      ).rejects.toBeInstanceOf(HostedToolRecoveryRequiredError);
+    } else {
+      const responses = await turn.execute(
+        [call],
+        assistant,
+        'model',
+        new AbortController().signal,
+      );
+      const tampered = structuredClone(responses);
+      tampered[0].functionResponse!.response!['error'] = 'different error';
+      await expect(
+        createTurn(true, undefined, hooks).resumeHookResults(
+          tampered,
+          'model',
+          new AbortController().signal,
+        ),
+      ).rejects.toBeInstanceOf(HostedToolRecoveryRequiredError);
+      await expect(
+        createTurn(true, undefined, hooks).resumeHookResults(
+          responses,
+          'model',
+          new AbortController().signal,
+        ),
+      ).resolves.toEqual(responses);
+    }
+    expect((await session.sink.project()).map((entry) => entry.type)).toEqual([
+      'assistant',
+      'tool_result',
+    ]);
+    expect(broker.execute).not.toHaveBeenCalled();
+    expect(hooks.fire).not.toHaveBeenCalled();
+  },
+);
+
+it('keeps Unicode refusal replay blocked by a real unresolved sibling Hook', async () => {
+  const pin = {
+    catalogId: 'unresolved',
+    catalogRevision: 1,
+    definitionDigest: 'a'.repeat(64),
+  };
+  const hookControl = vi.fn<HostedWorkspaceBroker['hookControl']>(
+    async (operation) => ({
+      operationId: operation.operationId,
+      ...(operation.kind === 'hook-catalog'
+        ? {
+            state: 'settled' as const,
+            catalog: {
+              ...pin,
+              hooks: [
+                {
+                  hookId: 'unresolved',
+                  eventName: HookEventName.PermissionRequest,
+                  sequential: false,
+                  async: false,
+                  failClosed: true,
+                  onceKey: null,
+                  config: { type: 'command' as const },
+                },
+              ],
+            },
+          }
+        : { state: 'outcome_unknown' as const }),
+    }),
+  );
+  const hookBroker = {
+    ...broker,
+    runtimeSessionId: 'prompt',
+    hookControl,
+    runtime: {
+      bindingId: 'binding',
+      generation: '1',
+      workspaceGeneration: '1',
+    },
+  } as unknown as HostedWorkspaceBroker;
+  const makeHooks = () =>
+    new HostedHookSession(
+      { baseUrl: 'http://127.0.0.1:1', token: 'test' },
+      session,
+      pin,
+      hookBroker,
+    );
+  const hooks = makeHooks();
+  const malformed = {
+    ...calls[0],
+    name: 'run_shell_command',
+    args: { command: '\ud800' },
+  };
+  const batch = [malformed, calls[1]];
+  turn = createTurn(true, undefined, hooks);
+  const responses = await turn.execute(
+    batch,
+    batch.map((call) => ({
+      functionCall: {
+        id: call.callId,
+        name: call.name,
+        args: call.args,
+      },
+    })),
+    'model',
+    new AbortController().signal,
+  );
+  const sibling = batch[1];
+  await expect(
+    hooks.fire(
+      HookEventName.PermissionRequest,
+      `prompt:${sibling.callId}`,
+      {
+        tool_name: sibling.name,
+        tool_input: sibling.args,
+        tool_use_id: sibling.callId,
+        prompt_id: 'prompt',
+      },
+      new AbortController().signal,
+    ),
+  ).rejects.toThrow('Hosted Hook requires reconciliation');
+  const child = session.authority
+    .extensionRecordsInDomain('hook_execution')
+    .map(
+      (entry) =>
+        entry.record as { hookId: string; run: Record<string, unknown> },
+    )
+    .find((record) => record.hookId === 'unresolved')!;
+  expect(child.run).toMatchObject({
+    state: 'recovery_blocked',
+    execution: 'outcome_unknown',
+  });
+  const marker = await hooks.status(
+    hostedHookOccurrenceId(
+      HookEventName.PermissionRequest,
+      `prompt:${sibling.callId}`,
+    ),
+    true,
+  );
+  expect(marker.resultRef).toBeNull();
+  expect(marker.run.execution).toBe('dispatch_started');
+  await expect(
+    createTurn(true, undefined, makeHooks()).resumeHookResults(
+      responses,
+      'model',
+      new AbortController().signal,
+    ),
+  ).rejects.toBeInstanceOf(HostedToolRecoveryRequiredError);
+  expect(broker.execute).not.toHaveBeenCalled();
+});
 
 it.each(['assistant-commit', 'second-call'] as const)(
   'settles every tool refusal when cancelled before a new Hook plan (%s)',

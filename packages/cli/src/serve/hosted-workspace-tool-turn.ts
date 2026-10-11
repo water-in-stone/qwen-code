@@ -1337,8 +1337,8 @@ export class HostedWorkspaceToolTurn {
                   /^[a-f0-9]{64}$/.test(plan.refusedInputDigest) &&
                   plan.hooks?.length === 0 &&
                   isDeepStrictEqual(plan.input, original) &&
-                  record.run.state === 'settled' &&
-                  record.run.execution === 'settled';
+                  (record.resultRef !== null ||
+                    record.run.execution === 'not_started_proven');
               }
               if (
                 (!record.resultRef &&

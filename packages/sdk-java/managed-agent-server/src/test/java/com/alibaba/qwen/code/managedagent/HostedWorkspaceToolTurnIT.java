@@ -421,7 +421,7 @@ class HostedWorkspaceToolTurnIT {
                     assertThat(driver.waitFor(faults || latency ? 130 : 270, TimeUnit.SECONDS)).as("Driver timeout: %s", Files.readString(log)).isTrue();
                     assertThat(driver.exitValue()).as("Driver output: %s", Files.readString(log)).isZero();
                     System.out.println(Files.readString(log));
-                    assertThat(Files.readString(log)).contains(unicode ? "HOSTED_SHELL_UNICODE_OK"
+                    assertThat(Files.readString(log)).contains(unicode ? "HOSTED_SHELL_UNICODE_OK: " + String.join(",", cases)
                             : operatorRecovery ? "HOSTED_OPERATOR_RECOVERY_OK" : latency ? "HOSTED_LATENCY_OK"
                             : providerControl ? "HOSTED_PROVIDER_FAULTS_OK"
                             : shellOutput ? "HOSTED_SHELL_OUTPUT_FAULTS_OK"
@@ -442,17 +442,20 @@ class HostedWorkspaceToolTurnIT {
                             assertThat(workspace.resolve("child/sibling.txt")).doesNotExist();
                             assertThat(Files.readString(workspace.resolve("child/unicode-ok.txt")))
                                     .isEqualTo("中文😀é\\ud800");
-                            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM qwen_tool_execution"
-                                    + " WHERE harness_session_id = ?", Integer.class, sessions.get(index).get("sessionId")))
-                                    .isEqualTo(1);
+                            int publications = jdbc.queryForObject("SELECT COUNT(*) FROM qwen_tool_publication", Integer.class);
+                            if (cases.contains("o2")) assertThat(publications).isPositive();
+                            else assertThat(publications).isZero();
                             assertThat(Files.readString(workspace.resolve("child/unicode-secondary-ok.txt")))
                                     .isEqualTo("中文😀é\\ud800");
-                            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM qwen_tool_execution"
-                                    + " WHERE harness_session_id = ?", Integer.class, secondarySessionId))
-                                    .isEqualTo(1);
-                            assertThat(jdbc.queryForObject("SELECT execution_status FROM qwen_tool_execution"
-                                    + " WHERE harness_session_id = ?", String.class, secondarySessionId))
-                                    .isEqualTo("success");
+                            for (String sessionId : List.of(sessions.get(index).get("sessionId").toString(), secondarySessionId)) {
+                                assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM qwen_tool_execution"
+                                        + " WHERE harness_session_id = ?", Integer.class, sessionId)).isEqualTo(1);
+                                var execution = jdbc.queryForMap("SELECT dispatch_generation, execution_state, execution_status"
+                                        + " FROM qwen_tool_execution WHERE harness_session_id = ?", sessionId);
+                                assertThat(((Number) execution.get("dispatch_generation")).longValue()).isEqualTo(1);
+                                assertThat(execution.get("execution_state")).isEqualTo("SETTLED");
+                                assertThat(execution.get("execution_status")).isEqualTo("success");
+                            }
                         } else if (providerControl) providerProbe.assertReport(sessions.get(index), reports.get(index));
                         else if (latency) {
                             boolean tool = cases.get(index).equals("tool");
