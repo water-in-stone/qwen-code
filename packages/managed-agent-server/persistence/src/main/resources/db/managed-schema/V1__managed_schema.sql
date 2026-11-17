@@ -1585,3 +1585,35 @@ CREATE TABLE ma_client_files_request (
 CREATE INDEX idx_ma_client_files_request_drain ON ma_client_files_request (session_scope_key, state, id);
 CREATE INDEX idx_ma_client_files_request_expiry ON ma_client_files_request (state, expires_at);
 CREATE INDEX idx_ma_client_files_request_session ON ma_client_files_request (session_scope_key);
+
+CREATE TABLE ma_capacity_domain (
+    domain_id VARBINARY(128) NOT NULL COMMENT 'Trusted deployment capacity domain, shared by its Brokers.',
+    policy_version BIGINT UNSIGNED NOT NULL COMMENT 'Durable policy revision.',
+    mode VARCHAR(16) NOT NULL COMMENT 'Observation only, enforcement is not yet qualified.',
+    domain_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Configured domain memory budget, not measured RSS.',
+    control_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Fixed control-plane reservation.',
+    harness_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Fixed aggregate Harness reservation including restore peaks.',
+    reserve_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Memory reserved for cleanup and other host work.',
+    worker_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Estimated reservation for each worker process tree.',
+    max_runtimes BIGINT UNSIGNED NOT NULL COMMENT 'Configured Runtime count budget, observational only.',
+    CONSTRAINT uk_ma_capacity_domain_business_key UNIQUE (domain_id),
+    CONSTRAINT ck_ma_capacity_domain_mode CHECK (mode = 'observe' AND CHAR_LENGTH(mode) = 7),
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'Database-generated identity of this row.',
+    CONSTRAINT pk_ma_capacity_domain_id PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT='Durable capacity observation policies.';
+
+CREATE TABLE ma_capacity_reservation (
+    domain_id VARBINARY(128) NOT NULL COMMENT 'Capacity domain owning this generation.',
+    binding_id VARBINARY(2048) NOT NULL COMMENT 'Original Runtime binding identity.',
+    runtime_generation BIGINT UNSIGNED NOT NULL COMMENT 'Original Runtime generation.',
+    reserved_bytes BIGINT UNSIGNED NOT NULL COMMENT 'Estimated process-tree reservation, not measured memory.',
+    reservation_state VARCHAR(16) NOT NULL COMMENT 'HELD until exact retirement proof, otherwise RELEASED.',
+    release_evidence_json LONGTEXT COMMENT 'Original worker stop evidence retained across binding GC.',
+    CONSTRAINT uk_ma_capacity_reservation_business_key UNIQUE (domain_id, binding_id, runtime_generation),
+    CONSTRAINT uk_ma_capacity_reservation_binding UNIQUE (binding_id, runtime_generation),
+    CONSTRAINT ck_ma_capacity_reservation_state CHECK ((reservation_state = 'HELD' AND CHAR_LENGTH(reservation_state) = 4) OR (reservation_state = 'RELEASED' AND CHAR_LENGTH(reservation_state) = 8 AND release_evidence_json IS NOT NULL)),
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT 'Database-generated identity of this row.',
+    CONSTRAINT pk_ma_capacity_reservation_id PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT='Observed generation reservations, never expiring by TTL.';
+
+CREATE INDEX idx_ma_capacity_reservation_state ON ma_capacity_reservation (domain_id, reservation_state);

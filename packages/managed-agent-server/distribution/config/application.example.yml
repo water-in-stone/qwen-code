@@ -50,3 +50,20 @@
 #       mode: developer-process-group
 #       cache-directory: /Users/developer/.qwen-managed-extension-cache
 #       cgroup-root: ''
+
+# Capacity observation is optional and never enables admission or worker stopping.
+# A domain must name one trusted host/pool shared by all its Brokers. All budgets
+# are explicit byte estimates; worker-bytes includes worker descendants. Values
+# below are examples, not measured production defaults. Leave unconfigured until
+# the physical domain and aggregate control/Harness reservations are known.
+# qwen:
+#   managed-agent:
+#     capacity:
+#       mode: observe
+#       domain-id: your-host
+#       domain-bytes: 8589934592
+#       control-bytes: 1073741824
+#       harness-bytes: 1073741824
+#       reserve-bytes: 1073741824
+#       worker-bytes: 536870912
+#       max-runtimes: 10

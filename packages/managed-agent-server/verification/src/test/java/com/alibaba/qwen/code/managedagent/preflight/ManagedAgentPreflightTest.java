@@ -60,12 +60,17 @@ class ManagedAgentPreflightTest {
                 "jdbc:h2:mem:preflight-capacity;DB_CLOSE_DELAY=-1")) {
             try (var statement = connection.createStatement()) {
                 statement.execute("CREATE TABLE ma_runtime_binding "
-                        + "(binding_state VARCHAR(32))");
+                        + "(binding_state VARCHAR(32), binding_id VARCHAR(128), runtime_generation BIGINT)");
                 statement.execute("CREATE TABLE ma_runtime_session "
                         + "(session_state VARCHAR(32))");
                 statement.execute("CREATE TABLE ma_operation "
                         + "(state VARCHAR(32))");
-                statement.execute("INSERT INTO ma_runtime_binding VALUES "
+                statement.execute("CREATE TABLE ma_capacity_domain (domain_id VARCHAR(128), domain_bytes BIGINT, "
+                        + "control_bytes BIGINT, harness_bytes BIGINT, reserve_bytes BIGINT, "
+                        + "worker_bytes BIGINT, max_runtimes BIGINT)");
+                statement.execute("CREATE TABLE ma_capacity_reservation (id BIGINT, domain_id VARCHAR(128), "
+                        + "binding_id VARCHAR(128), runtime_generation BIGINT, reserved_bytes BIGINT, reservation_state VARCHAR(16))");
+                statement.execute("INSERT INTO ma_runtime_binding (binding_state) VALUES "
                         + "('READY'), ('READY'), ('DRAINING')");
                 statement.execute("INSERT INTO ma_runtime_session VALUES "
                         + "('READY'), ('RELEASED')");

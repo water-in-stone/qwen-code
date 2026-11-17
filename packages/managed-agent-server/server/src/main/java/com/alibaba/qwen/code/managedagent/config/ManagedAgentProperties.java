@@ -76,6 +76,7 @@ public class ManagedAgentProperties
     private final Dispatch dispatch = new Dispatch();
     private final Events events = new Events();
     private final RuntimeBroker runtimeBroker = new RuntimeBroker();
+    private final Capacity capacity = new Capacity();
     private final Auth auth = new Auth();
     private final InternalServer internalServer = new InternalServer();
     private final Automation automation = new Automation();
@@ -103,6 +104,38 @@ public class ManagedAgentProperties
     // Null on a plain `new`; the sweep then falls back to magnitude bands.
     @Getter(AccessLevel.NONE)
     private Environment environment;
+
+    @Getter
+    @Setter
+    public static class Capacity {
+        private String mode = "observe";
+        private String domainId = "";
+        private long domainBytes;
+        private long controlBytes;
+        private long harnessBytes;
+        private long reserveBytes;
+        private long workerBytes;
+        private long maxRuntimes;
+
+        public com.alibaba.qwen.code.runtimebroker.RuntimeCapacityPolicy policy() {
+            if (!"off".equals(mode) && !"observe".equals(mode)) {
+                throw new IllegalArgumentException("capacity.mode supports off or observe only; "
+                        + "admission and idle reclamation are not qualified yet");
+            }
+            if ("off".equals(mode)) {
+                return null;
+            }
+            if (StringUtils.isBlank(domainId)) {
+                if (domainBytes != 0 || controlBytes != 0 || harnessBytes != 0
+                        || reserveBytes != 0 || workerBytes != 0 || maxRuntimes != 0) {
+                    throw new IllegalArgumentException("capacity.domain-id is required with a budget");
+                }
+                return null;
+            }
+            return new com.alibaba.qwen.code.runtimebroker.RuntimeCapacityPolicy(domainId,
+                    domainBytes, controlBytes, harnessBytes, reserveBytes, workerBytes, maxRuntimes);
+        }
+    }
 
     @Getter
     @Setter
@@ -377,6 +410,7 @@ public class ManagedAgentProperties
 
     @PostConstruct
     void validateWorkspaceFiles() {
+        capacity.policy();
         applySessionStoreDefaults();
         applyClientFilesDefaults();
         applyHarnessCredentialsFile();

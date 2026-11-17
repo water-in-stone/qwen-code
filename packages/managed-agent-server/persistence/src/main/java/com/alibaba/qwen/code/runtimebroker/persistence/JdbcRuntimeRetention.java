@@ -160,7 +160,8 @@ public final class JdbcRuntimeRetention implements com.alibaba.qwen.code.runtime
             return new BatchResult(candidate.cursor(phase, childState, childKey), 1, children, skipped, executions, sessions, 0);
         }
         int retired = 0;
-        if (!hasChildren(connection, binding) && !operatorReferenced(connection, binding)
+        if (!JdbcRuntimeCapacity.held(connection, binding.getBindingId())
+                && !hasChildren(connection, binding) && !operatorReferenced(connection, binding)
                 && !references.bindingReferenced(connection, binding)) {
             try (PreparedStatement deletion = statement(connection,
                     "DELETE FROM ma_runtime_binding WHERE binding_id = ? AND record_version = ?")) {

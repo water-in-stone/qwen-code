@@ -47,6 +47,7 @@ public class RuntimeBrokerConfiguration {
     @ConditionalOnProperty(prefix = "qwen.managed-agent.runtime-broker",
             name = "enabled", havingValue = "true")
     public RuntimeBindingRepository runtimeBindingRepository(
+            ManagedAgentProperties properties,
             @Qualifier("managedAgentDataSource") DataSource dataSource, SecretProtector secretProtector,
             @Qualifier("managedJdbcTemplate") org.springframework.jdbc.core.JdbcTemplate jdbc,
             org.springframework.beans.factory.ObjectProvider<com.alibaba.qwen.code.managedagent.contracts.artifact.ToolPublicationObjectStore> objects,
@@ -57,7 +58,8 @@ public class RuntimeBrokerConfiguration {
         return new JdbcRuntimeBindingRepository(dataSource, secretProtector,
                 sessionResourceSettings == null ? null
                         : new com.alibaba.qwen.code.managedagent.persistence.JdbcJournalPacks(
-                                jdbc, objects.getIfAvailable(), sessionResourceSettings));
+                                jdbc, objects.getIfAvailable(), sessionResourceSettings),
+                () -> java.util.UUID.randomUUID().toString(), properties.getCapacity().policy());
     }
 
     @Bean

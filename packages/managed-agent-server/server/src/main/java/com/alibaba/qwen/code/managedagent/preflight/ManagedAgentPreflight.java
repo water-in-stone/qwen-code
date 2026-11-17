@@ -2154,12 +2154,14 @@ public final class ManagedAgentPreflight {
                     "ma_runtime_session", "session_state");
             Map<String, Long> operations = stateCounts(connection,
                     "ma_operation", "state");
+            var capacity = com.alibaba.qwen.code.runtimebroker.persistence.JdbcRuntimeCapacity.observe(connection);
             String detail = "runtime-bindings=" + bindings
                     + "; runtime-sessions=" + sessions
                     + "; operations=" + operations
                     + "; physical-processes=unknown"
-                    + "; memory=unknown; idle-reclamation=not measured";
-            return new Check("capacity", Status.PASS, detail, null);
+                    + "; memory=unknown; idle-reclamation=not measured; " + capacity.detail();
+            return new Check("capacity", capacity.warning() ? Status.WARN : Status.PASS, detail,
+                    capacity.warning() ? "reconcile domain coverage and budget estimates before enabling admission" : null);
         } catch (SQLException error) {
             return capacityUnavailable(error);
         }

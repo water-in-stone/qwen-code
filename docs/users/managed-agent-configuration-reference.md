@@ -90,6 +90,21 @@ The automation runtime: the scanner that fires scheduled automation definitions,
 | `scan-delay` | `QWEN_MANAGED_AGENT_AUTOMATION_SCAN_DELAY` | duration | `10s` | How long the automation scanner waits between the end of one tick and the start of the next. Startup refuses a non-positive value when automation is enabled. A plain number is milliseconds. |
 | `scanner-threads` | — | integer | `4` | How many definition rows one scanner tick works in parallel; the tick waits for all of them before the next tick starts. Because a lease is not counted from the tick's start (see `qwen.managed-agent.automation.lease`), a long tick hands out no already-expired lease. Startup refuses a value below 1 when `qwen.managed-agent.automation.enabled` is true. |
 
+## `qwen.managed-agent.capacity`
+
+Optional durable capacity observation. No admission or idle reclamation is enabled. A configured domain records estimated worker reservations across Brokers.
+
+| Property | Variable | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `control-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_CONTROL_BYTES` | integer | `0` | Fixed aggregate control-plane memory reservation in bytes. |
+| `domain-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_BYTES` | integer | `0` | Configured aggregate memory budget in bytes, not measured RSS. Required with a domain. |
+| `domain-id` | `QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_ID` | string | *(empty)* | Trusted physical host/pool identity, shared by its Brokers. Empty disables domain accounting. Only local-process generations are assigned. |
+| `harness-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_HARNESS_BYTES` | integer | `0` | Fixed aggregate Harness reservation in bytes, including load peaks across instances. |
+| `max-runtimes` | `QWEN_MANAGED_AGENT_CAPACITY_MAX_RUNTIMES` | integer | `0` | Observational Runtime count budget; excess is reported, not rejected. |
+| `mode` | `QWEN_MANAGED_AGENT_CAPACITY_MODE` | string | `observe` | off or observe. admit/enforce are refused until their protocols are implemented and qualified. |
+| `reserve-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_RESERVE_BYTES` | integer | `0` | Memory in bytes reserved for cleanup and other host work. |
+| `worker-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_WORKER_BYTES` | integer | `0` | Estimated bytes reserved per local worker process tree, never a measured physical allocation. |
+
 ## `qwen.managed-agent.channels`
 
 The trusted channel adapter surface on the internal listener and the lease on outbound delivery claims.

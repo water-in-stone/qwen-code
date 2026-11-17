@@ -75,6 +75,15 @@ qwen:
       gc-enabled: '${QWEN_MANAGED_AGENT_TOOL_PUBLICATION_GC_ENABLED:false}'
       deletion-grace: '${QWEN_MANAGED_AGENT_TOOL_PUBLICATION_DELETION_GRACE:24h}'
       verification-concurrency: '${QWEN_MANAGED_AGENT_TOOL_PUBLICATION_VERIFICATION_CONCURRENCY:2}'
+    capacity:
+      mode: '${QWEN_MANAGED_AGENT_CAPACITY_MODE:observe}'
+      domain-id: '${QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_ID:}'
+      domain-bytes: '${QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_BYTES:0}'
+      control-bytes: '${QWEN_MANAGED_AGENT_CAPACITY_CONTROL_BYTES:0}'
+      harness-bytes: '${QWEN_MANAGED_AGENT_CAPACITY_HARNESS_BYTES:0}'
+      reserve-bytes: '${QWEN_MANAGED_AGENT_CAPACITY_RESERVE_BYTES:0}'
+      worker-bytes: '${QWEN_MANAGED_AGENT_CAPACITY_WORKER_BYTES:0}'
+      max-runtimes: '${QWEN_MANAGED_AGENT_CAPACITY_MAX_RUNTIMES:0}'
     harness:
       enabled: '${QWEN_MANAGED_AGENT_HARNESS_ENABLED:false}'
       workspace-files-enabled: '${QWEN_MANAGED_AGENT_WORKSPACE_FILES_ENABLED:false}'

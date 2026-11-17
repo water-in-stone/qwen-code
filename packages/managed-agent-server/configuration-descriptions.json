@@ -91,6 +91,10 @@
     "qwen.managed-agent.session-resources": {
       "en": "Externalization of oversized private Session resources and cold storage of closed Session journals into immutable object storage, with independent default-off controls for resource writes, pack building, and SQL body eviction.",
       "zh": "将超大的私有 Session 资源与已关闭 Session 的日志冷藏到不可变对象存储；资源写入、pack 构建与 SQL 正文腾空由各自独立、默认关闭的开关控制。"
+    },
+    "qwen.managed-agent.capacity": {
+      "en": "Optional durable capacity observation. No admission or idle reclamation is enabled. A configured domain records estimated worker reservations across Brokers.",
+      "zh": "可选的持久容量观测，不启用准入或空闲回收。配置资源域后跨 Broker 记录 worker 的估算预留。"
     }
   },
   "properties": {
@@ -917,6 +921,38 @@
     "qwen.managed-agent.runtime-broker.web-terminal": {
       "en": "Whether newly resolved ordinary local Workspace bindings select the terminal-capable measured profile (managed-workspace-execution/2 plus web-terminal/1), whose worker serves the interactive user-terminal upgrade route. Defaults to false and requires tool-measurements. The capability digest is a frozen binding input: deploy matching control-plane, Harness and Runtime artifacts together before enabling. SSH, extension and external-scratch placements keep their existing profiles. See the [Managed Web Terminal design](../design/2026-11-10-managed-web-terminal.md).",
       "zh": "是否让新解析的普通本地 Workspace binding 选择带终端能力的测量 profile（managed-workspace-execution/2 加 web-terminal/1），其 worker 提供交互式用户终端 upgrade 路由。默认 false，且要求开启 tool-measurements。capability digest 是冻结的 binding 输入：启用前先协同部署配套的控制平面、Harness 与 Runtime 制品。SSH、extension 与 external-scratch 放置保留现有 profile。参见 [Managed Web 终端设计](../design/2026-11-10-managed-web-terminal.zh-CN.md)。"
+    },
+    "qwen.managed-agent.capacity.mode": {
+      "en": "off or observe. admit/enforce are refused until their protocols are implemented and qualified.",
+      "zh": "off 或 observe；准入和回收协议实现并验证之前拒绝 admit/enforce。"
+    },
+    "qwen.managed-agent.capacity.domain-id": {
+      "en": "Trusted physical host/pool identity, shared by its Brokers. Empty disables domain accounting. Only local-process generations are assigned.",
+      "zh": "受信任的物理主机/池身份，由其 Broker 共享。留空关闭域核算，仅归属 local-process generation。"
+    },
+    "qwen.managed-agent.capacity.domain-bytes": {
+      "en": "Configured aggregate memory budget in bytes, not measured RSS. Required with a domain.",
+      "zh": "配置的域总内存预算（字节），不是实测 RSS；配置域时必填。"
+    },
+    "qwen.managed-agent.capacity.control-bytes": {
+      "en": "Fixed aggregate control-plane memory reservation in bytes.",
+      "zh": "控制面的固定总内存预留（字节）。"
+    },
+    "qwen.managed-agent.capacity.harness-bytes": {
+      "en": "Fixed aggregate Harness reservation in bytes, including load peaks across instances.",
+      "zh": "Harness 的固定总内存预留（字节），含跨实例加载峰值。"
+    },
+    "qwen.managed-agent.capacity.reserve-bytes": {
+      "en": "Memory in bytes reserved for cleanup and other host work.",
+      "zh": "为清理与其他主机工作预留的内存（字节）。"
+    },
+    "qwen.managed-agent.capacity.worker-bytes": {
+      "en": "Estimated bytes reserved per local worker process tree, never a measured physical allocation.",
+      "zh": "每个本地 worker 进程树的估算预留字节数，不是实测物理分配。"
+    },
+    "qwen.managed-agent.capacity.max-runtimes": {
+      "en": "Observational Runtime count budget; excess is reported, not rejected.",
+      "zh": "用于观测的 Runtime 数量预算；超出仅报告，不拒绝。"
     }
   }
 }

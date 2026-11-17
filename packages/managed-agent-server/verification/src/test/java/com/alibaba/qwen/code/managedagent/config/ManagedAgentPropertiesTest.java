@@ -36,6 +36,21 @@ public class ManagedAgentPropertiesTest {
             "qwen.managed-agent.runtime-broker.trusted-local-reboot-recovery";
 
     @Test
+    void capacityObservationIsOptionalAndRejectsUnqualifiedEnforcement() {
+        var capacity = new ManagedAgentProperties.Capacity();
+        org.junit.jupiter.api.Assertions.assertNull(capacity.policy());
+        capacity.setMode("admit");
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, capacity::policy);
+        capacity.setMode("observe");
+        capacity.setWorkerBytes(1);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, capacity::policy);
+        capacity.setDomainId("host");
+        capacity.setDomainBytes(100);
+        capacity.setMaxRuntimes(10);
+        org.junit.jupiter.api.Assertions.assertEquals("host", capacity.policy().domainId());
+    }
+
+    @Test
     void generatedAccessorsKeepNestedBindingAndInternalStatePrivate() {
         new ApplicationContextRunner()
                 .withUserConfiguration(PropertiesConfiguration.class)

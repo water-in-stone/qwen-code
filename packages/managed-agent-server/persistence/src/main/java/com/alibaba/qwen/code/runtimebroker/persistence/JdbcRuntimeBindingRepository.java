@@ -8,6 +8,7 @@ import com.alibaba.qwen.code.runtimebroker.RuntimeAdmission;
 import com.alibaba.qwen.code.runtimebroker.RuntimeBindingRecord;
 import com.alibaba.qwen.code.runtimebroker.RuntimeBindingRepository;
 import com.alibaba.qwen.code.runtimebroker.RuntimeBrokerException;
+import com.alibaba.qwen.code.runtimebroker.RuntimeCapacityPolicy;
 import com.alibaba.qwen.code.runtimebroker.RuntimeDrainReceipt;
 import com.alibaba.qwen.code.runtimebroker.RuntimeLease;
 import com.alibaba.qwen.code.runtimebroker.RuntimeLifecycleAuthority;
@@ -104,6 +105,7 @@ public final class JdbcRuntimeBindingRepository
     private final SecretProtector secretProtector;
     private final Supplier<String> idSupplier;
     private final JdbcJournalPacks journalPacks;
+    private final RuntimeCapacityPolicy capacityPolicy;
 
     public JdbcRuntimeBindingRepository(DataSource dataSource,
             SecretProtector secretProtector) {
@@ -123,6 +125,13 @@ public final class JdbcRuntimeBindingRepository
     public JdbcRuntimeBindingRepository(DataSource dataSource,
             SecretProtector secretProtector, JdbcJournalPacks journalPacks,
             Supplier<String> idSupplier) {
+        this(dataSource, secretProtector, journalPacks, idSupplier, null);
+    }
+
+    public JdbcRuntimeBindingRepository(DataSource dataSource,
+            SecretProtector secretProtector, JdbcJournalPacks journalPacks,
+            Supplier<String> idSupplier, RuntimeCapacityPolicy capacityPolicy) {
+        this.capacityPolicy = capacityPolicy;
         this.dataSource = JdbcRepositorySupport.requireDataSource(dataSource);
         if (secretProtector == null) {
             throw new IllegalArgumentException("secretProtector is required");
@@ -1061,6 +1070,7 @@ public final class JdbcRuntimeBindingRepository
         return JdbcRepositorySupport.transaction(
                 dataSource,
                 connection -> {
+                    JdbcRuntimeCapacity.lockDomain(connection, capacityPolicy);
                     lockPlacementDomain(connection, request.getScope().getTenantId());
                     requireHarnessAdmission(connection, request);
                     String key = JdbcRepositorySupport.requestKey(request);
@@ -1075,6 +1085,7 @@ public final class JdbcRuntimeBindingRepository
                                 || !active.getRequest().equals(request)) {
                             throw new IllegalStateException("Runtime binding slot is inconsistent");
                         }
+                        JdbcRuntimeCapacity.observe(connection, capacityPolicy, active, false);
                         return active;
                     }
 
@@ -1110,6 +1121,7 @@ public final class JdbcRuntimeBindingRepository
                                     null,
                                     now);
                     insertBinding(connection, created);
+                    JdbcRuntimeCapacity.observe(connection, capacityPolicy, created, true);
                     try (PreparedStatement statement =
                             connection.prepareStatement(
                                     "UPDATE ma_runtime_slot "
@@ -1812,6 +1824,7 @@ public final class JdbcRuntimeBindingRepository
                 throw new SQLException("Runtime binding update failed");
             }
         }
+        JdbcRuntimeCapacity.releaseProven(connection, record);
     }
 
     private void setBinding(PreparedStatement statement,

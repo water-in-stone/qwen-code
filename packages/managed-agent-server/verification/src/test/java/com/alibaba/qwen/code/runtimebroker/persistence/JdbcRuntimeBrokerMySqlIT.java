@@ -44,6 +44,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class JdbcRuntimeBrokerMySqlIT {
     @Test
+    void observesCapacityAcrossBrokersWithoutReleasingUnknownWorkers() throws Exception {
+        inIsolatedSchema("broker_capacity_", JdbcRuntimeCapacityTest::verifyOnMySql);
+    }
+
+    @Test
     void physicalAliasesReleaseOnlyTheirMatchingHolder() throws Exception {
         inIsolatedSchema("broker_physical_", JdbcPhysicalStorageReleaseTest::verify);
     }

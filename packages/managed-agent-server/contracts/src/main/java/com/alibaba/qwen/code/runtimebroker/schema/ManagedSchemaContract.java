@@ -37,6 +37,8 @@ public final class ManagedSchemaContract {
                     "ma_workspace",
                     "ma_workspace_access",
                     "ma_storage",
+                    "ma_capacity_domain",
+                    "ma_capacity_reservation",
                     "ma_runtime_slot",
                     "ma_runtime_binding",
                     "ma_runtime_session",

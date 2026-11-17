@@ -18,6 +18,32 @@ authentication and writer credentials" below.
 设计说明：[English](../../docs/design/2026-09-19-managed-agent-spring-server.md) |
 [简体中文](../../docs/design/2026-09-19-managed-agent-spring-server.zh-CN.md)
 
+## Capacity observation
+
+The optional `qwen.managed-agent.capacity` settings attach new `local-process`
+Runtime generations to a trusted host/pool domain and record estimated memory
+reservations in SQL. Brokers sharing that physical domain must configure the same
+ID and budgets. Domain policies are immutable in this slice: a conflicting
+configuration is refused rather than overwriting the shared policy. Domain IDs
+must contain 1–128 ASCII letters, digits, `.`, `_`, `:` or `-`.
+
+`--check` reports configured domain budgets, held estimates, over-budget warnings
+and unaccounted binding records. These are not measured process counts or RSS.
+Existing unaccounted workers are not attributed to the Broker that happens to
+receive their next request. Unsupported providers and missing domain mappings
+remain unaccounted. Unknown outcomes stay HELD, and only original-worker stop
+proof returns an observed reservation; retention keeps HELD binding evidence.
+
+Only `mode=off|observe` is available, with `observe` and no domain configured by
+default. Exceeding a configured budget reports a warning and still admits work.
+`admit` and `enforce` are rejected; capacity admission, physical memory enforcement,
+Harness parking and automatic Runtime reclamation are not implemented here.
+See the [configuration reference](../../docs/users/managed-agent-configuration-reference.md#qwenmanaged-agentcapacity)
+and the paired [English](../../docs/design/2026-11-17-managed-capacity-idle-reclamation.md)
+and [Chinese](../../docs/design/2026-11-17-managed-capacity-idle-reclamation.zh-CN.md)
+design for the remaining rollout. The pre-release V1 baseline changed; recreate
+development catalogs and deploy matching server/Broker schema consumers together.
+
 ## Local embedded profile
 
 The installed CLI starts local Managed mode with `qwen serve --managed --open`.

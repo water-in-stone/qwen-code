@@ -90,6 +90,21 @@ Managed Agent 服务端的顶层设置：内置 agent 的修订号、存储的 A
 | `scan-delay` | `QWEN_MANAGED_AGENT_AUTOMATION_SCAN_DELAY` | 时长 | `10s` | 自动化扫描器从一轮扫描结束到下一轮开始之间等待的时长。开启自动化时，非正值启动时拒绝。不带单位的数字按毫秒计。 |
 | `scanner-threads` | — | 整数 | `4` | 单个扫描轮次并行处理的定义行数；该轮会等待所有行处理完毕，下一轮才开始。由于租约不是从本轮开始时起算（见 `qwen.managed-agent.automation.lease`），扫描轮次再长也不会发放已经过期的租约。`qwen.managed-agent.automation.enabled` 为 true 时，小于 1 的值启动时拒绝。 |
 
+## `qwen.managed-agent.capacity`
+
+可选的持久容量观测，不启用准入或空闲回收。配置资源域后跨 Broker 记录 worker 的估算预留。
+
+| 属性 | 环境变量 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `control-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_CONTROL_BYTES` | 整数 | `0` | 控制面的固定总内存预留（字节）。 |
+| `domain-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_BYTES` | 整数 | `0` | 配置的域总内存预算（字节），不是实测 RSS；配置域时必填。 |
+| `domain-id` | `QWEN_MANAGED_AGENT_CAPACITY_DOMAIN_ID` | 字符串 | *（空）* | 受信任的物理主机/池身份，由其 Broker 共享。留空关闭域核算，仅归属 local-process generation。 |
+| `harness-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_HARNESS_BYTES` | 整数 | `0` | Harness 的固定总内存预留（字节），含跨实例加载峰值。 |
+| `max-runtimes` | `QWEN_MANAGED_AGENT_CAPACITY_MAX_RUNTIMES` | 整数 | `0` | 用于观测的 Runtime 数量预算；超出仅报告，不拒绝。 |
+| `mode` | `QWEN_MANAGED_AGENT_CAPACITY_MODE` | 字符串 | `observe` | off 或 observe；准入和回收协议实现并验证之前拒绝 admit/enforce。 |
+| `reserve-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_RESERVE_BYTES` | 整数 | `0` | 为清理与其他主机工作预留的内存（字节）。 |
+| `worker-bytes` | `QWEN_MANAGED_AGENT_CAPACITY_WORKER_BYTES` | 整数 | `0` | 每个本地 worker 进程树的估算预留字节数，不是实测物理分配。 |
+
 ## `qwen.managed-agent.channels`
 
 内部监听端口上的受信渠道适配器接口，以及出站投递认领的租约。

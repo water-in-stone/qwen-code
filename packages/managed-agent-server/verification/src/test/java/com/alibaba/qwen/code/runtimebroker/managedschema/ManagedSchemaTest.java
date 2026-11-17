@@ -56,6 +56,8 @@ class ManagedSchemaTest {
             Map.entry("ma_extension_settings", List.of("settings_key")),
             Map.entry("ma_extension_operation", List.of("operation_key")),
             Map.entry("ma_storage", List.of("alias_key")),
+            Map.entry("ma_capacity_domain", List.of("domain_id")),
+            Map.entry("ma_capacity_reservation", List.of("domain_id", "binding_id", "runtime_generation")),
             Map.entry("ma_runtime_slot", List.of("request_key")),
             Map.entry("ma_runtime_binding", List.of("binding_id")),
             Map.entry("ma_runtime_session", List.of("scope_key", "runtime_session_id")),

@@ -60,6 +60,19 @@ class JdbcRuntimeRetentionTest {
     private static final JdbcRuntimeRetention.ReferenceGuard NO_REFERENCES = guard(Set.of(), Set.of());
 
     @Test
+    void heldCapacityReservationPreservesTheOriginalBinding() throws Exception {
+        Fixture fixture = new Fixture();
+        RuntimeBindingRecord binding = fixture.binding("capacity-held", "local-process", false, "RELEASED");
+        fixture.execute("INSERT INTO ma_capacity_reservation "
+                        + "(domain_id, binding_id, runtime_generation, reserved_bytes, reservation_state) "
+                        + "VALUES ('host', ?, ?, 100, 'HELD')",
+                binding.getBindingId(), binding.getGeneration());
+        fixture.complete(10, NO_REFERENCES);
+        assertNotNull(fixture.bindings.findById(binding.getBindingId()),
+                "uncertain physical occupancy must keep its binding evidence");
+    }
+
+    @Test
     void ageBoundaryUsesTheDatabaseClockAndRequiresStrictlyOlderRows() throws Exception {
         Instant databaseNow = Instant.parse("2001-06-01T00:00:00Z");
         Instant cutoff = databaseNow.minus(MAX_AGE);
